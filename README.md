@@ -81,7 +81,7 @@ It supports **Hybrid Decompilation** (Smali/Java), **Context-Aware Analysis** (C
     *   **`static_only`:** Blazing fast keyword scanning.
     *   **`hybrid`:** The best of both worlds—Static keywords filter the noise, AI verifies the danger.
 *   **🛠️ Flexible Configuration:** a simple yet powerful configuration file (`config/settings.yaml`) allows for easy management of LLM providers, models, rules, and **Decompiler Settings** (Apktool/JADX).
-*   **🕸️ Context-Aware Scanning:** Utilizes a **Call Graph** to understand file dependencies. Use Cross-Reference Context to let the AI know *who* calls a function and with *what* arguments.
+*   **🕸️ Context-Aware Scanning:** Utilizes a **Call Graph** to understand file dependencies. Use Cross-Reference Context to let the AI know *who* calls a function and with *what* arguments. [Read the Docs](CROSS_REFERENCE_CONTEXT.md)
 *   **📚 RAG with OWASP MASVS:** Every finding is automatically enriched with the relevant **OWASP Mobile Application Security Verification Standard (MASVS)** ID (e.g., `MASVS-STORAGE-1`), making your reports audit-ready instantly.
 *   **🤖 Multi-Provider Support:** Run locally with **Ollama** (free & private) or scale up with **Gemini**, **Groq**, and **OpenAI**.
 *   **📊 Structured Security Reports:** Get detailed JSON output containing severity, confidence scores, evidence snippets, and even an "Attack Surface Map" of the application.
