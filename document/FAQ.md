@@ -38,7 +38,7 @@ Droid LLM Hunter complements, rather than replaces, traditional SAST. Traditiona
 <details>
 <summary>What are the main sources of false positives/negatives, and how does DLH mitigate them?</summary>
 
-- **False Positives** often arise from the AI misunderstanding benign code patterns. DLH mitigates this through the multi-stage pipeline (summarize → filter → deep scan) and especially the Cross-Reference Context, which provides the AI with crucial caller/callee information.
+- **False Positives** often arise from the AI misunderstanding benign code patterns. DLH mitigates this through specialized per-rule prompts, static file-rule routing, summary/cross-reference context, and structured verdict validation. Preliminary risk-triage is not trusted as a security verdict or candidate gate.
 
 - **False Negatives** can occur if code patterns are highly obfuscated, or if the relevant vulnerability rules are not yet defined. DLH mitigates this by making the rule system fully extensible and encouraging community contributions.
 
@@ -54,11 +54,29 @@ Droid LLM Hunter complements, rather than replaces, traditional SAST. Traditiona
 - **The LLM Provider/Model:** Local models (Ollama) depend on hardware (GPU/CPU). Cloud models (Groq/Gemini/OpenAI/Anthropic) are generally faster but depend on network latency.
 - **Active Rules:** Enabling more rules increases the number of queries sent to the LLM.
 - **Context Injection:** Using Cross-Reference Context (Call Graph) adds more data to process, slightly increasing analysis time for better accuracy.
+- **Exhaustive Hybrid Queue:** Every scoped hybrid candidate is deep-scanned. This preserves offensive recall after discovery but means a large candidate set can still take hours.
+- **Cache State:** A warm cache avoids provider calls, but candidate collection, call-graph construction, file scheduling, and accounting still run.
 
 **Tips to speed up:**
 - Use `gemini-2.5-flash` or `groq` (fastest cloud providers)
-- Use `hybrid` filter mode instead of `llm_only`
-- Disable rules you don't need for the current scan
+- Use `hybrid` instead of `llm_only` when enabled-rule signal discovery is acceptable
+- Keep `summary_workers: 2` as the conservative default; raise it only within provider rate limits, or lower it to `1` for unstable providers
+- Keep `hybrid_risk_triage: false`; enabling legacy triage adds one redundant LLM call per successful summary
+- Use `static_only` for a very large initial pass, then run `hybrid` on the attack surfaces that need summary/cross-reference context
+- Narrow rules only when that reduced audit scope is explicitly intended; unrequested rules will not be analyzed
+
+The optimized hybrid path does not promise a scan under one hour. It saves time through concurrency and removal of redundant calls, not by dropping candidates.
+
+</details>
+
+---
+
+<details>
+<summary>Can hybrid prioritization hide a vulnerability candidate?</summary>
+
+Not after a file has entered the scoped hybrid candidate set. Static-pattern hits are submitted first, then every remaining scoped candidate is appended. There is no score threshold, top-N cutoff, or time-budget gate, and the report waits for the complete queue.
+
+Candidate discovery itself still depends on the union of signals supplied by enabled rules. Highly obfuscated code or an unknown wrapper may therefore require an additive rule keyword/regex update or an `llm_only` follow-up. A summary/triage failure is recorded as `Error/Unanalyzed` and cannot mark the file clean.
 
 </details>
 

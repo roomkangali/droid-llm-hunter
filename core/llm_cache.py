@@ -1,5 +1,7 @@
 import os
 import hashlib
+import tempfile
+import threading
 from typing import Dict, Any
 from core import log
 
@@ -36,18 +38,68 @@ class CachedLLMClient:
 
     def __init__(self, client, cache_dir: str, model: str, enabled: bool = True):
         # Set via __dict__ to avoid triggering __getattr__ during init.
+        self.__dict__["_state_lock"] = threading.RLock()
+        self.__dict__["_key_locks"] = {}
         self.__dict__["_client"] = client
         self.__dict__["enabled"] = enabled
         self.__dict__["model"] = model or ""
         self.__dict__["cache_dir"] = cache_dir
         self.__dict__["hits"] = 0
         self.__dict__["misses"] = 0
+        self.__dict__["errors"] = []
         if enabled:
             try:
                 os.makedirs(cache_dir, exist_ok=True)
             except Exception as e:
                 log.warning(f"Could not create cache dir '{cache_dir}': {e}. Caching disabled.")
+                self._record_error("initialize", cache_dir, "", e)
                 self.__dict__["enabled"] = False
+
+    def _record_error(self, operation: str, path: str, key: str, error: Exception):
+        """Keep non-fatal cache failures observable to the scan report."""
+        with self.__dict__["_state_lock"]:
+            self.__dict__["errors"].append({
+                "operation": operation,
+                "path": path,
+                "key": key,
+                "detail": str(error),
+            })
+
+    def _increment(self, name: str):
+        with self.__dict__["_state_lock"]:
+            self.__dict__[name] += 1
+
+    def _lock_for_key(self, key: str):
+        """Return the process-local lock that serializes one content cache key."""
+        with self.__dict__["_state_lock"]:
+            return self.__dict__["_key_locks"].setdefault(key, threading.Lock())
+
+    def _atomic_write(self, path: str, result: str):
+        """Publish a complete cache entry atomically; never expose a partial file."""
+        fd = None
+        temporary_path = None
+        try:
+            fd, temporary_path = tempfile.mkstemp(
+                prefix=f".{os.path.basename(path)}.",
+                suffix=".tmp",
+                dir=self.cache_dir,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as cache_file:
+                fd = None
+                cache_file.write(result)
+            os.replace(temporary_path, path)
+            temporary_path = None
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if temporary_path is not None:
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
 
     def _client_fingerprint(self) -> str:
         """Output-affecting client settings that aren't part of the prompt.
@@ -63,6 +115,7 @@ class CachedLLMClient:
             return fp() or ""
         except Exception as e:
             log.warning(f"Could not read client cache fingerprint: {e}. Ignoring it.")
+            self._record_error("fingerprint", self.cache_dir, "", e)
             return ""
 
     def _key(self, code_snippet: str, context: Dict[str, Any]) -> str:
@@ -92,32 +145,65 @@ class CachedLLMClient:
 
         key = self._key(code_snippet, context)
         path = self._path(key)
+        key_lock = self._lock_for_key(key)
 
-        if os.path.exists(path):
+        # Holding this lock across the underlying request intentionally deduplicates
+        # same-key concurrent work. The context manager always releases it on timeout,
+        # exception, or an empty response.
+        with key_lock:
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        cached = f.read()
+                    self._increment("hits")
+                    log.debug(f"Cache HIT ({key[:12]}) for {context.get('file_path', 'N/A')}")
+                    return cached
+                except Exception as e:
+                    log.debug(f"Cache read failed for {key[:12]}: {e}")
+                    self._record_error("read", path, key, e)
+
+            result = self._client.analyze_code(code_snippet, context)
+            self._increment("misses")
+
+            # Only persist successful responses so failures are retried on resume.
+            if result and result.strip():
+                try:
+                    self._atomic_write(path, result)
+                except Exception as e:
+                    log.debug(f"Cache write failed for {key[:12]}: {e}")
+                    self._record_error("write", path, key, e)
+
+            return result
+
+    def invalidate(self, code_snippet: str, context: Dict[str, Any]) -> bool:
+        """Remove one exact cache entry after higher-level response validation fails.
+
+        The key calculation is identical to ``analyze_code``. This is used by
+        structured batch callers that can only determine a partial/invalid response
+        after the provider has returned it; individual cache entries are untouched.
+        """
+        if not self.enabled:
+            return False
+        key = self._key(code_snippet, context)
+        path = self._path(key)
+        with self._lock_for_key(key):
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    cached = f.read()
-                self.__dict__["hits"] += 1
-                log.debug(f"Cache HIT ({key[:12]}) for {context.get('file_path', 'N/A')}")
-                return cached
+                if os.path.exists(path):
+                    os.unlink(path)
+                    return True
             except Exception as e:
-                log.debug(f"Cache read failed for {key[:12]}: {e}")
-
-        result = self._client.analyze_code(code_snippet, context)
-        self.__dict__["misses"] += 1
-
-        # Only persist successful responses so failures are retried on resume.
-        if result and result.strip():
-            try:
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(result)
-            except Exception as e:
-                log.debug(f"Cache write failed for {key[:12]}: {e}")
-
-        return result
+                log.debug(f"Cache invalidation failed for {key[:12]}: {e}")
+                self._record_error("invalidate", path, key, e)
+        return False
 
     def cache_stats(self) -> dict:
-        return {"hits": self.hits, "misses": self.misses, "enabled": self.enabled}
+        with self.__dict__["_state_lock"]:
+            return {
+                "hits": self.hits,
+                "misses": self.misses,
+                "enabled": self.enabled,
+                "errors": list(self.errors),
+            }
 
     def __getattr__(self, name):
         # Only reached for attributes not found on this wrapper -> delegate to real client.

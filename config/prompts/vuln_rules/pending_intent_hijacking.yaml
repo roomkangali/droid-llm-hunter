@@ -7,7 +7,12 @@ prompt: |
   - Usage of `PendingIntent.getActivity`, `getService`, or `getBroadcast`.
   - The `flags` argument uses `FLAG_MUTABLE` (0x02000000) OR implies mutability by NOT specifying `FLAG_IMMUTABLE` (0x04000000).
   - IMPORTANT: In modern Android, checking for `FLAG_MUTABLE` or absence of `FLAG_IMMUTABLE` is critical.
-  
+
+  Not vulnerable if the PendingIntent never leaves the app's own process (e.g. passed only to
+  AlarmManager/NotificationManager to re-invoke this same app later), or if a mutable
+  PendingIntent's target component/action is hardcoded to this app's own package and cannot be
+  redirected by whichever component ends up filling/sending it.
+
   Code to Analyze:
   ```
   {code_snippet}
@@ -26,5 +31,5 @@ keywords:
   - "FLAG_MUTABLE"
   - "getActivity"
   - "getService"
-detection_pattern: "PendingIntent(?:\\.|;->)(getActivity|getService|getBroadcast).*(FLAG_MUTABLE|33554432)"
+detection_pattern: '(?:PendingIntent(?:\.|;->)(getActivity|getService|getBroadcast).*(FLAG_MUTABLE|33554432)|const(?:/high16)?\s+\w+,\s+(?:0x0?2000000|33554432)[\s\S]*?Landroid/app/PendingIntent;->(?:getActivity|getService|getBroadcast)|PendingIntent\.(?:getActivity|getService|getBroadcast)\s*\((?:(?!FLAG_IMMUTABLE|67108864|0x0?4000000).)*\))'
 tags: ["intents", "privilege_escalation", "pending_intent"]

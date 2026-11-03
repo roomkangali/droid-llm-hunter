@@ -5,7 +5,10 @@ Locks in config-schema invariants: the shipped settings validate, rules stay A-Z
 (list-rules order), the rule count is stable, and the Gemini key field is consistent
 with the other providers (v1.2.0 #16 rename).
 """
-from core.config_loader import load_settings, RulesSettings, LLMSettings
+import pytest
+from pydantic import ValidationError
+
+from core.config_loader import AnalysisSettings, load_settings, RulesSettings, LLMSettings
 
 
 def test_shipped_settings_are_valid():
@@ -86,9 +89,36 @@ def test_codex_provider_fields_exist():
 
 
 def test_new_v120_settings_exist():
-    for field in ("max_workers", "use_cache", "max_input_chars"):
+    for field in ("max_workers", "summary_workers", "summary_batch_size", "hybrid_risk_triage", "use_cache", "max_input_chars"):
         assert field in __import__("core.config_loader", fromlist=["AnalysisSettings"]).AnalysisSettings.model_fields
     assert "max_tokens" in LLMSettings.model_fields
+
+
+def test_summary_workers_is_bounded_without_changing_deep_workers():
+    assert AnalysisSettings().summary_workers == 2
+    assert AnalysisSettings(summary_workers=1).summary_workers == 1
+    assert AnalysisSettings(summary_workers=32).summary_workers == 32
+    with pytest.raises(ValidationError):
+        AnalysisSettings(summary_workers=0)
+    with pytest.raises(ValidationError):
+        AnalysisSettings(summary_workers=33)
+    assert AnalysisSettings(summary_workers=7, max_workers=3).max_workers == 3
+
+
+def test_summary_batch_size_is_opt_in_and_bounded():
+    assert AnalysisSettings().summary_batch_size == 1
+    assert AnalysisSettings(summary_batch_size=2).summary_batch_size == 2
+    assert AnalysisSettings(summary_batch_size=8).summary_batch_size == 8
+    assert AnalysisSettings(summary_batch_size=32).summary_batch_size == 32
+    with pytest.raises(ValidationError):
+        AnalysisSettings(summary_batch_size=0)
+    with pytest.raises(ValidationError):
+        AnalysisSettings(summary_batch_size=33)
+
+
+def test_hybrid_risk_triage_defaults_off_but_keeps_legacy_rollback():
+    assert AnalysisSettings().hybrid_risk_triage is False
+    assert AnalysisSettings(hybrid_risk_triage=True).hybrid_risk_triage is True
 
 
 def test_golden_baseline_is_well_formed():

@@ -19,4 +19,4 @@ prompt: |
 
   Context: file = {file_path}
 tags: ["storage", "contentprovider", "path-traversal"]
-detection_pattern: "(openFile|FileInputStream|FileOutputStream)\\s*\\("
+detection_pattern: "((openFile|FileInputStream|FileOutputStream)\\s*\\(|new\\s+File\\s*\\(|Ljava/io/File;-><init>\\s*\\()"

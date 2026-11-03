@@ -29,9 +29,10 @@ prompt: |
   - File Path: {file_path}
 keywords:
   - "getParcelableExtra"
+  - "getParcelable"
   - "startActivity"
   - "startService"
   - "sendBroadcast"
   - "EXTRA_INTENT"
 tags: ["intents", "ipc", "redirection", "confused_deputy", "privilege_escalation"]
-detection_pattern: "getParcelableExtra\\s*[(<]"
+detection_pattern: "(getParcelableExtra|getParcelable)\\s*[(<]"

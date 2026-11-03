@@ -7,7 +7,12 @@ prompt: |
   - Usage of `ObjectInputStream.readObject()`.
   - The input stream is derived from an untrusted source, such as `intent.getSerializableExtra()` or data from the network/disk.
   - If the class being deserialized is not validated (e.g., look-ahead deserialization), it can lead to RCE.
-  
+
+  Not vulnerable if the accepted classes are restricted via an `ObjectInputStream.resolveClass`
+  override or `ObjectInputFilter` allowlist, or if the serialized bytes never originate from
+  outside the app's own trusted storage/IPC boundary (e.g. written and read only by this app,
+  never from an Intent extra, network response, or world-accessible file).
+
   Code to Analyze:
   ```
   {code_snippet}

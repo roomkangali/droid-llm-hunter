@@ -20,7 +20,11 @@ prompt: |
         throw new SecurityException("ZipSlip detected!");
     }}
     ```
-  
+
+  Not vulnerable if the ZIP source is bundled with the app itself (a signed APK asset, not
+  something attacker-suppliable at runtime) so its entries are not attacker-controlled, or if a
+  canonical-path/prefix check (as in the secure example above) is already present.
+
   Code to Analyze:
   ```
   {code_snippet}

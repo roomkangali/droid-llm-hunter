@@ -8,7 +8,11 @@ prompt: |
   - Usage of `Method.invoke(obj, args)` where method name or args are attacker-controlled.
   - Usage of `ClassLoader.loadClass`.
   - Pattern: `String cls = intent.getStringExtra("class"); Class.forName(cls);`
-  
+
+  Not vulnerable if the class/method name resolved via reflection is a fixed, hardcoded string
+  (never derived from external input), or if the resolved class/method is checked against an
+  explicit allowlist before `Class.forName`/`Method.invoke` is actually called.
+
   Code to Analyze:
   ```
   {code_snippet}

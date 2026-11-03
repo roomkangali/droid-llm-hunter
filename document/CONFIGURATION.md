@@ -17,57 +17,60 @@ All settings are managed in `config/settings.yaml`. This file controls:
 
 ## Filter Mode (`filter_mode`)
 
-Configure the analysis strategy to balance speed, cost, and accuracy.
+Configure the analysis strategy to balance discovery breadth, context, elapsed time, and provider cost. The shipped `config/settings.yaml` currently selects `static_only` for a faster initial scan; select `hybrid` explicitly when exhaustive processing of the hybrid scoped candidate set and summary-based context are required.
 
 ### 1. `llm_only`
 
-**Decision Maker:** 100% AI (LLM).
+**Candidate source:** complete Java/Smali code tree, followed by normal scope filtering.
 
 **How it works:**
 
-1. All Smali files are chunked and summarized by the LLM (`summarize_chunks`).
-2. The summaries are analyzed by the LLM to identify risks (`identify_risky_chunks`).
-3. Only files marked as "Risky" are deep-scanned.
+1. All code files for the selected decompiler output are collected and scope-filtered.
+2. Every scoped file is summarized by the LLM (`summarize_chunks`).
+3. Risk identification supplies ordering information.
+4. `_select_deep_scan_targets()` retains the complete scoped set, so every scoped file is submitted to deep rule analysis.
 
 | | |
 |--|--|
-| ✅ **Pros** | Most Intelligent (understands context), Minimal False Negatives |
-| ❌ **Cons** | Most Expensive (high token usage), Slowest |
+| ✅ **Pros** | Does not depend on static signals for initial code-file discovery; maximum scoped breadth |
+| ❌ **Cons** | Most expensive and slowest; still model/rule dependent and cannot guarantee 100% accuracy |
 
 ---
 
 ### 2. `static_only`
 
-**Decision Maker:** Classic Keyword Matching (`CodeFilter`).
+**Candidate source:** local keyword/regex matching (`CodeFilter`).
 
 **How it works:**
 
-1. The scanner searches for dangerous keywords (e.g., `WebView`, `SQLite`, `Cipher`).
-2. If found, the file is immediately marked for deep scan.
-3. LLM is NOT used for filtering.
+1. The scanner searches using built-in signals plus the union of active-rule keywords/regex.
+2. Matching files pass through normal scope filtering and are scheduled for deep scan.
+3. Preliminary LLM summarization/risk-triage is skipped; applicable rule verdicts are still produced by the LLM.
 
 | | |
 |--|--|
-| ✅ **Pros** | Super Fast, Zero Token Cost for filtering |
-| ❌ **Cons** | "Dumb" (no context), High False Positives, High False Negatives (obfuscation) |
+| ✅ **Pros** | Fast initial pass; zero provider calls for preliminary filtering |
+| ❌ **Cons** | Less application-wide summary context; discovery depends on available static signals |
 
 ---
 
 ### 3. `hybrid` *(Recommended)*
 
-**Decision Maker:** Static Analyzer + LLM Verification.
+**Candidate source:** enabled-rule static signals, followed by LLM context and exhaustive scheduling.
 
 **How it works:**
 
-1. **Phase 1 (Static):** Find files with dangerous keywords.
-2. **Phase 2 (LLM Verification):** Only those specific files are summarized and checked by the LLM to confirm if they are truly risky.
+1. **Discovery:** Collect the union of keywords/regex from enabled rules and apply scope filtering.
+2. **Context:** Summarize every scoped candidate with bounded parallel workers, restoring stable order afterward.
+3. **Priority:** Put static-pattern hits first, then append every remaining scoped candidate.
+4. **Deep analysis:** Submit the entire queue. The report waits for every scheduled file and rule check.
 
-> **[v1.3.0] Recall safeguard:** first-party files whose content matches an enabled rule's `detection_pattern` are deep-scanned even if the LLM risk-triage would skip them — a strong static signal is never dropped. See [Architecture](ARCHITECTURE_EXPLANATION.md).
+> **Current recall contract:** risk-triage is disabled by default because it was redundant. Static hits affect priority only; all scoped hybrid candidates reach deep scan. Summary/worker failures are recorded as `Error/Unanalyzed` and fail open. See [Architecture](ARCHITECTURE_EXPLANATION.md).
 
 | | |
 |--|--|
-| ✅ **Pros** | Extreme Token Savings (ignores safe files), Good Accuracy |
-| ❌ **Cons** | Risk of Obfuscation (same as static_only) |
+| ✅ **Pros** | Summary/cross-reference context with no post-discovery score/top-N cutoff |
+| ❌ **Cons** | Can remain slow on large APKs; candidate discovery is still limited by active-rule signals |
 
 ---
 
@@ -75,9 +78,9 @@ Configure the analysis strategy to balance speed, cost, and accuracy.
 
 | Scenario | Recommended Mode |
 |----------|-----------------|
-| Need 100% accuracy, have abundant tokens | `llm_only` |
-| Daily usage (balanced speed & cost) | `hybrid` ✅ |
-| Low on tokens or need very fast scan | `static_only` |
+| Maximum scoped code-file breadth, cost secondary | `llm_only` |
+| Contextual offensive audit of rule-signal candidates | `hybrid` ✅ |
+| Very large initial pass or constrained time/tokens | `static_only` |
 
 ---
 
@@ -208,6 +211,42 @@ At the end of a scan the log reports effectiveness, e.g. `Response cache: 40 hit
 ### Parallelism (`analysis.max_workers`) — default `2`
 
 Number of files deep-scanned in parallel. Raise it for fast providers (Groq, Gemini); keep it low if you hit rate limits.
+
+### Hybrid Summary Parallelism (`analysis.summary_workers`) — default `2`
+
+Number of candidate files summarized concurrently in `hybrid` mode. The value is bounded to `1..32`; use `1` to restore serial summarization for a rate-limited provider. Every scoped candidate is still summarized and scheduled for deep scan, and results are restored to their original file order before cross-reference, app-summary, and attack-surface context is built. This setting does not change `static_only` or `llm_only` behavior.
+
+### Optional Hybrid Summary Batching (`analysis.summary_batch_size`) — default `1`
+
+Experimental opt-in batching for hybrid summaries, bounded to `1..32`. The default `1` preserves the established per-file/per-Smali-chunk prompt and cache identity. Values above `1` ask the provider for a strict opaque-ID-to-summary JSON mapping; a partial response retries only missing items individually, while an empty, invalid, or timed-out batch retries every affected item individually. If that fallback also fails, the file remains scheduled for deep scan and is reported `Unanalyzed`.
+
+Partial or invalid batch responses are removed from cache, while valid individual fallbacks retain the original cache key. A trailing single item is always processed individually because wrapping it cannot save a call. Batch size `4` passed the recorded golden recall contract, but remains opt-in because total runtime depends on provider latency, prompt size, call graph, deep scan, and fallback rate.
+
+### Hybrid Risk Triage (`analysis.hybrid_risk_triage`) — default `false`
+
+The legacy risk-triage call only changed priority after hybrid was made exhaustive, so it is skipped by default. Static-pattern hits are processed first and every remaining scoped candidate still reaches deep analysis. Set this to `true` only to restore the legacy LLM-based ordering for A/B comparison or rollback; it adds one LLM call per successful file summary and does not increase candidate coverage.
+
+Hybrid deep scanning submits this complete ordered target list to the bounded executor. Pattern hits start first, but the report waits for every target; there is no top-N, score threshold, time cutoff, or early stop. `scan_metrics` records scheduled/completed/error file tasks and scheduled/accounted deep-rule calls. An incomplete accounting state is reported as a pipeline error, never as a clean scan. This ordered result merge applies only to `hybrid`; `static_only` and `llm_only` retain their existing paths.
+
+### Choosing a Profile for a Large APK
+
+Use this conservative hybrid profile when preserving hybrid context and exhaustive analysis of every scoped candidate is the priority:
+
+```yaml
+analysis:
+  filter_mode: hybrid
+  summary_workers: 2
+  summary_batch_size: 1
+  hybrid_risk_triage: false
+```
+
+Increase `summary_workers` only within the provider's concurrency/rate limit. A rejected or unstable provider can create retries and erase the benefit; setting it back to `1` changes execution speed, not candidate membership. Batch size `4` is an optional high-latency-provider experiment with per-item fail-open fallback. It is not the default because measured end-to-end gains were not consistent.
+
+For a very large first pass where elapsed time matters more than hybrid cross-reference summaries, select `filter_mode: static_only`. It skips hybrid summarization and risk-triage, but still sends the resulting static candidates through rule analysis; it is not equivalent to hybrid and may provide the agent less application-wide context. Follow with hybrid for the rules or attack surfaces that need deeper context.
+
+An explicit `--rules` list is an operator-selected audit scope, not an automatic performance optimization. It intentionally excludes rules the operator did not request (and requested rules must be enabled in `settings.yaml`). Do not use a narrow list when the objective is a full vulnerability sweep.
+
+These optimizations do not guarantee that a large APK finishes in under an hour. Candidate collection, full Smali call-graph construction when cross-reference is enabled, and exhaustive deep rule analysis still run. Cache hits avoid provider calls but do not skip that queue or convert an incomplete scan into a clean result.
 
 ### Input Truncation (`analysis.max_input_chars`) — default `30000`
 

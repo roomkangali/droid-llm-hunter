@@ -11,6 +11,10 @@ prompt: |
 
   Focus on WHAT is stored: plaintext secrets are the issue. Storing non-sensitive prefs is fine.
 
+  Not vulnerable if the sensitive value is encrypted before being written (EncryptedSharedPreferences,
+  Jetpack Security, or a Keystore-wrapped key), or if what's actually stored is non-sensitive app
+  state (UI flags, settings, cached non-secret data) rather than a password/token/PII/credential.
+
   Code:
   ```
   {code_snippet}

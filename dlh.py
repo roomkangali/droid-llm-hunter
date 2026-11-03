@@ -83,12 +83,12 @@ def main(ctx: typer.Context,
 
 @app.command(no_args_is_help=True)
 def scan(ctx: typer.Context,
-         apk_path: str = typer.Argument(..., help="Path to the APK file to analyze."),
+         apk_path: str = typer.Argument(..., help="Path to the APK, XAPK, or APKS file to analyze."),
          generate_exploit: bool = typer.Option(False, "--generate-exploit", help="Generate PoC scripts for detected vulnerabilities."),
          scan_libraries: bool = typer.Option(False, "--scan-libraries", help="Include 3rd party libraries in scan scope (e.g. androidx, google, okhttp)."),
          no_cache: bool = typer.Option(False, "--no-cache", help="Disable the LLM response cache (force fresh calls, no resume).")):
     """
-    Scan an APK file for vulnerabilities.
+    Scan an APK, XAPK, or APKS file for vulnerabilities.
     """
     output = ctx.meta["output"]
     no_decompile = ctx.meta["no_decompile"]

@@ -8,7 +8,11 @@ prompt: |
   - Enabling file access from file URLs: `setAllowFileAccessFromFileURLs(true)`.
   - Enabling universal access: `setAllowUniversalAccessFromFileURLs(true)`.
   - Risk: If an attacker can load a local file (e.g. via an exposed Component or XSS in a local file), they can read other local files or databases (Cookies).
-  
+
+  Not vulnerable if the WebView only ever loads content the app itself bundles (no exported entry
+  point, no Intent-controlled URL) and never reaches an attacker-influenced page that could
+  actually exploit the file-access setting.
+
   Code to Analyze:
   ```
   {code_snippet}

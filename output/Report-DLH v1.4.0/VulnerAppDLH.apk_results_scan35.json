@@ -1,0 +1,234 @@
+{
+  "scan_status": "Completed",
+  "app_summary": "- Deliberately vulnerable Android security-training app exposing demonstrations of storage, IPC, WebView, injection, cryptography, and code-execution flaws.\n- Manifest enables `android:debuggable=\"true\"` and `android:allowBackup=\"true\"`, increasing runtime inspection and backup-based data-extraction exposure.\n- No dangerous permissions requested.\n- 17 components are exported: 15 activities and two receivers. Every exported activity is directly invocable by other apps without a component-level permission.\n- `WebViewActivity` accepts browsable `dlh://webview` deep links; `UnprotectedExportedActivity` accepts browsable `vulnerapp://*` links.\n- `SpoofableReceiver` accepts the unprotected `ACTION_RESET_PASSWORD` broadcast. `ProfileInstallReceiver` has intent filters but requires `android.permission.DUMP`.\n- Particularly sensitive exported activities include `IntentRedirectionActivity`, which launches an unvalidated nested `forward_intent`; `SQLInjectionActivity`; `SecretsActivity`; `InsecureFileActivity`; `DeserializationActivity`; `ReflectionActivity`; `PendingIntentActivity`; and `ZipSlipActivity`.\n- Exported `HijackTargetActivity` uses `singleTask` with attacker-associated task affinity `com.attacker.hijack`, creating task-hijacking exposure.\n- The app stores dummy usernames and secrets in a local SQLite database and can disclose records through injectable raw SQL queries.",
+  "attack_surface_map": {
+    "exported_activities": [
+      "MainActivity",
+      "SecretsActivity",
+      "WebViewActivity",
+      "SQLInjectionActivity",
+      "InsecureFileActivity",
+      "CryptoActivity",
+      "GraphQLInjectionActivity",
+      "UnprotectedExportedActivity",
+      "DeserializationActivity",
+      "ReflectionActivity",
+      "PendingIntentActivity",
+      "ZipSlipActivity",
+      "IntentRedirectionActivity",
+      "FragmentInjectionActivity",
+      "HijackTargetActivity"
+    ],
+    "exported_receivers": [
+      "SpoofableReceiver",
+      "ProfileInstallReceiver"
+    ],
+    "exported_services": [],
+    "exported_providers": [],
+    "deep_links": [
+      {
+        "scheme": "dlh",
+        "host": "webview",
+        "handler": "WebViewActivity"
+      },
+      {
+        "scheme": "vulnerapp",
+        "host": "*",
+        "handler": "UnprotectedExportedActivity"
+      }
+    ],
+    "unprotected_broadcasts": [
+      "com.dlh.vulnerapp.ACTION_RESET_PASSWORD"
+    ],
+    "network": [
+      "webview",
+      "graphql"
+    ],
+    "file_io": false,
+    "ipc": true,
+    "deserialization": false,
+    "reflection": false,
+    "manifest_flags": {
+      "debuggable": true,
+      "allow_backup": true
+    }
+  },
+  "results": [
+    {
+      "file": "output/VulnerAppDLH.apk_decompiled/sources/com/dlh/vulnerapp/IntentRedirectionActivity.java",
+      "rule": "intent_redirection",
+      "vulnerability": "Intent Redirection",
+      "status": "Vulnerable",
+      "result": {
+        "is_vulnerable": true,
+        "severity": "High",
+        "confidence": "High",
+        "evidence": "Intent forward = (Intent) getIntent().getParcelableExtra(\"forward_intent\");\nif (forward != null) {\n    startActivity(forward);\n}",
+        "description": "The exported activity extracts an attacker-controlled nested Intent and passes it directly to startActivity without validating or constraining its component, package, action, data, flags, or URI grants. This violates MASVS-PLATFORM-1 and creates an Intent-redirection confused-deputy vulnerability that may expose non-exported application components or relay URI permissions using the vulnerable app's identity.",
+        "attack_scenario": "A malicious app explicitly launches com.dlh.vulnerapp.IntentRedirectionActivity and supplies a crafted Intent in the forward_intent extra. The nested Intent targets a non-exported activity in com.dlh.vulnerapp or carries attacker-selected data and permission flags. The exported activity then launches it as the vulnerable app, bypassing the target component's intended external-access boundary or relaying granted URI access.",
+        "attacker_priority": "HIGH",
+        "recommendation": "Do not forward caller-supplied Intent objects. Construct a new Intent internally and explicitly set an allowlisted component or package, copying only strictly validated extras and data. If forwarding is unavoidable, verify the caller's identity and signature, resolve and allowlist the exact destination, reject unsafe flags and ClipData, and remove URI-grant flags unless explicitly required. Make this activity non-exported if external access is unnecessary.",
+        "false_positive_analysis": "The manifest context confirms that the receiving activity is exported, so another app can explicitly target it despite the absence of intent filters. The snippet shows no caller authentication, destination allowlist, explicit trusted target assignment, or sanitization before startActivity. A broader application-level control not shown here could reduce exploitability, but no such control is evidenced in the provided code or manifest context.",
+        "masvs_reference": {
+          "id": "MASVS-PLATFORM-1",
+          "description": "The app uses IPC mechanisms securely. Do not forward Intents received from untrusted callers without validating the target; a mutable/nested Intent enables confused-deputy attacks against non-exported components.",
+          "link": "https://mas.owasp.org/MASVS/controls/MASVS-PLATFORM-1/"
+        }
+      }
+    },
+    {
+      "file": "output/VulnerAppDLH.apk_decompiled/sources/com/dlh/vulnerapp/SQLInjectionActivity.java",
+      "rule": "sql_injection",
+      "vulnerability": "SQL Injection",
+      "status": "Vulnerable",
+      "result": {
+        "is_vulnerable": true,
+        "severity": "High",
+        "confidence": "High",
+        "evidence": "String query = $searchInput.getText().toString();\nthis$0.performVulnerableSearch(query);\nString sql = \"SELECT * FROM users WHERE name = '\" + username + '\\'';\nCursor cursor = db.rawQuery(sql, null);",
+        "description": "The activity violates MASVS-CODE-4 because text controlled by the user flows from an EditText into a raw SQL statement through direct string concatenation. The resulting statement is executed by rawQuery without placeholders or bound selection arguments, enabling SQL injection and unauthorized disclosure of user secrets.",
+        "attack_scenario": "An attacker explicitly launches the exported SQLInjectionActivity, enters a payload such as ' OR '1'='1' -- into the search field, and taps the search button. The application constructs a query whose WHERE clause is always true, causing it to display every row, including the admin secret.",
+        "attacker_priority": "HIGH",
+        "recommendation": "Use a parameterized query, for example db.rawQuery(\"SELECT * FROM users WHERE name = ?\", new String[]{username}). Alternatively, use SQLiteDatabase.query with selection \"name = ?\" and username in selectionArgs. Never concatenate EditText content into SQL.",
+        "false_positive_analysis": "The complete source-to-sink flow is present in the snippet: attacker-controlled EditText content is passed unchanged to performVulnerableSearch, concatenated into SQL, and executed with rawQuery(sql, null). The manifest also confirms that the activity is exported, so another application can explicitly launch it even though it has no intent filter. Exploitation still requires interaction with the displayed search UI, but this does not negate the demonstrated injection.",
+        "masvs_reference": {
+          "id": "MASVS-CODE-4",
+          "description": "The app validates and sanitizes all untrusted inputs. Ensure that inputs are validated to prevent Injection attacks.",
+          "link": "https://mas.owasp.org/MASVS/controls/MASVS-CODE-4/"
+        }
+      }
+    }
+  ],
+  "poc_results": [
+    {
+      "file": "output/VulnerAppDLH.apk_decompiled/sources/com/dlh/vulnerapp/IntentRedirectionActivity.java",
+      "rule": "intent_redirection",
+      "status": "generated",
+      "runtime_status": "not-run",
+      "artifact_path": "output/VulnerAppDLH_exploits_scan35/intent_redirection_IntentRedirectionActivity.java.js",
+      "validation": {
+        "status": "valid",
+        "checks": [
+          {
+            "name": "syntax",
+            "status": "passed",
+            "detail": "node --check"
+          },
+          {
+            "name": "extra_provenance",
+            "status": "warning",
+            "detail": "nested Intent observation marker is local to the Frida verification flow: verification_marker"
+          },
+          {
+            "name": "extra_provenance",
+            "status": "passed",
+            "detail": "forward_intent"
+          },
+          {
+            "name": "intent_payload",
+            "status": "passed",
+            "detail": "nested extra constructed with putExtra: forward_intent"
+          },
+          {
+            "name": "intent_trigger",
+            "status": "passed",
+            "detail": "startActivity invocation present"
+          },
+          {
+            "name": "success_indicator",
+            "status": "warning",
+            "detail": "runtime success condition requires authorized manual verification"
+          }
+        ],
+        "execution": "not-run"
+      }
+    },
+    {
+      "file": "output/VulnerAppDLH.apk_decompiled/sources/com/dlh/vulnerapp/SQLInjectionActivity.java",
+      "rule": "sql_injection",
+      "status": "generated",
+      "runtime_status": "not-run",
+      "artifact_path": "output/VulnerAppDLH_exploits_scan35/sql_injection_SQLInjectionActivity.java.sh",
+      "validation": {
+        "status": "valid",
+        "checks": [
+          {
+            "name": "syntax",
+            "status": "passed",
+            "detail": "bash -n"
+          },
+          {
+            "name": "component_provenance",
+            "status": "warning",
+            "detail": "dynamic component not statically verified: $COMPONENT"
+          },
+          {
+            "name": "success_indicator",
+            "status": "warning",
+            "detail": "runtime success condition requires authorized manual verification"
+          }
+        ],
+        "execution": "not-run"
+      }
+    }
+  ],
+  "analysis_errors": [],
+  "scan_metrics": {
+    "decompiled_code_files": 9603,
+    "candidates_raw": 56,
+    "candidates_scoped": 3,
+    "summaries_requested": 3,
+    "summaries_nonempty": 3,
+    "summarization_calls": 3,
+    "summary_batch_size": 1,
+    "summary_batch_requests": 0,
+    "summary_batch_items": 0,
+    "summary_batch_valid_items": 0,
+    "summary_batch_fallback_items": 0,
+    "summary_batch_failures": 0,
+    "risk_triage_calls": 0,
+    "hybrid_risk_triage": "skipped_redundant",
+    "app_summary_calls": 1,
+    "attack_surface_calls": 1,
+    "triage_yes": 0,
+    "triage_no": 0,
+    "triage_errors": 0,
+    "static_pattern_hits": 2,
+    "deep_scan_targets": 3,
+    "deep_rule_checks": 2,
+    "deep_rule_checks_scheduled": 2,
+    "deep_rule_checks_accounted": 2,
+    "deep_rule_checks_completed": 2,
+    "deep_rule_checks_vulnerable": 2,
+    "deep_rule_checks_not_vulnerable": 0,
+    "deep_rule_checks_error": 0,
+    "deep_rule_accounting_complete": true,
+    "deep_scan_priority": "static_pattern_then_scoped_stable",
+    "deep_scan_files_scheduled": 3,
+    "deep_scan_files_completed": 3,
+    "deep_scan_files_error": 0,
+    "deep_scan_file_accounting_complete": true,
+    "manifest_rule_checks": 0,
+    "strings_rule_checks": 0,
+    "exploit_attempts": 2,
+    "exploit_generated": 2,
+    "exploit_successes": 2,
+    "exploit_errors": 0,
+    "exploit_validation_errors": 0,
+    "candidate_collection_seconds": 0.25858255999628454,
+    "summarization_seconds": 8.730214564013295,
+    "risk_triage_seconds": 0.0,
+    "app_summary_seconds": 12.394668846973218,
+    "attack_surface_seconds": 11.89613173296675,
+    "deep_scan_seconds": 12.194861717987806,
+    "report_results": 2,
+    "vulnerable_results": 2,
+    "not_vulnerable_results": 0,
+    "error_results": 0,
+    "analysis_errors": 0,
+    "cache_hits": 0,
+    "cache_misses": 0,
+    "cache_enabled": false,
+    "errors_by_stage": {}
+  }
+}

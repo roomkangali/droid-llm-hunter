@@ -8,7 +8,11 @@ prompt: |
   - The Activity is `exported=true` (check Manifest context if available, otherwise assume risky if unknown).
   - The method `isValidFragment` is MISSING or simply returns `true` without validation.
   - This allows attackers to load arbitrary fragments via `Intent.EXTRA_SHOW_FRAGMENT` (`:android:show_fragment`).
-  
+
+  Not vulnerable if `isValidFragment` checks the requested fragment name against an explicit
+  allowlist of trusted class names (not just returning `true` for everything), or if the Activity
+  is not exported and cannot be reached by other apps.
+
   Code to Analyze:
   ```
   {code_snippet}
