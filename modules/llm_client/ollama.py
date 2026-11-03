@@ -59,9 +59,12 @@ class OllamaClient(BaseLLMClient):
         system_prompt = context.get("system_prompt", "")
         vuln_prompt = context.get("vuln_prompt", "")
 
-        formatted_prompt = vuln_prompt.format(
-            code_snippet=code_snippet,
-            file_path=context.get("file_path", "N/A")
-        )
+        # .replace() rather than .format(): a rule prompt (or the code snippet spliced
+        # into it) can legitimately contain literal braces — a JSON example in the
+        # prompt, or decompiled Java/Kotlin — and .format() would read those as
+        # placeholders and raise KeyError/IndexError mid-scan. Matches router9.py,
+        # openrouter.py and codex.py.
+        formatted_prompt = vuln_prompt.replace("{code_snippet}", code_snippet)
+        formatted_prompt = formatted_prompt.replace("{file_path}", context.get("file_path", "N/A"))
 
         return f"{system_prompt}\n\n{formatted_prompt}"

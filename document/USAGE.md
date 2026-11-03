@@ -50,6 +50,21 @@ python dlh.py scan [APK file]
   ```bash
   python dlh.py --rules "sql_injection,webview_xss" scan target.apk
   ```
+  > `--rules` narrows the run to the requested rules that are already enabled in `settings.yaml`; it does not enable disabled rules. This is an operator-selected scope and may intentionally omit other vulnerability classes.
+
+- **Select exhaustive hybrid candidate processing:**
+  ```bash
+  python dlh.py config filter-mode hybrid
+  python dlh.py scan target.apk
+  ```
+  > Hybrid summarizes the scoped rule-signal candidates, prioritizes static-pattern hits, and still deep-scans every scoped candidate. For the conservative worker/batching settings, see [Configuration](CONFIGURATION.md#choosing-a-profile-for-a-large-apk).
+
+- **Use the faster initial profile for a very large APK:**
+  ```bash
+  python dlh.py config filter-mode static_only
+  python dlh.py scan target.apk
+  ```
+  > `static_only` skips preliminary summary/triage calls but still uses the LLM for applicable deep rule verdicts. It provides less summary-based context than hybrid.
 
 - **Save output to a specific file:**
   ```bash
@@ -141,4 +156,4 @@ python dlh.py scan [APK file]
 +---------------------------------------+------------------------------------------------------------+
 ```
 
-> **Note:** Performance/cost knobs — `max_workers`, `max_input_chars` (`analysis:`), and `max_tokens` (`llm:`) — are set in `config/settings.yaml`, not via CLI. See [Configuration → Performance & Cost Controls](CONFIGURATION.md#performance--cost-controls).
+> **Note:** Performance/cost knobs—`summary_workers`, `summary_batch_size`, `hybrid_risk_triage`, `max_workers`, `max_input_chars` (`analysis:`), and `max_tokens` (`llm:`)—are set in `config/settings.yaml`, not via CLI. The recall-validated hybrid defaults are `summary_workers: 2`, `summary_batch_size: 1`, and `hybrid_risk_triage: false`. See [Configuration → Performance & Cost Controls](CONFIGURATION.md#performance--cost-controls).

@@ -20,6 +20,10 @@ prompt: |
   - If the ONLY problem in the snippet is one of the above, set is_vulnerable=false for THIS rule
     (another rule will report it). Only flag a genuine trust/logic flaw as defined above.
 
+  Not vulnerable if the security-sensitive decision (auth result, role, price, quantity) is
+  verified or re-derived server-side before the sensitive action executes — a client-side flag
+  that is purely advisory/UI-only and backed by a real server-side check is not a logic flaw.
+
   Code to Analyze:
   ```
   {code_snippet}

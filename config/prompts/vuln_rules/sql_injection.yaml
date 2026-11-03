@@ -20,4 +20,4 @@ prompt: |
   Context: file = {file_path}
   Put the exploitation in attack_scenario and the parameterized-query fix in recommendation.
 tags: ["sql", "database", "injection"]
-detection_pattern: "(rawQuery|execSQL)\\s*\\("
+detection_pattern: "(rawQuery|execSQL|query)\\s*\\("

@@ -7,6 +7,10 @@ prompt: |
   - `File.setReadable(true, false)` or `File.setWritable(true, false)` — the second arg `false` means "not owner-only", i.e. readable/writable by ALL apps.
   These make the file accessible to other apps on the device and can leak sensitive data.
 
+  Not vulnerable if the widened permission only ever applies to a file with no sensitive content
+  (e.g. a public asset bundled with the app), or if the file is written to app-private internal
+  storage with the default owner-only mode (no `setReadable`/`setWritable` widening at all).
+
   Code:
   ```
   {code_snippet}

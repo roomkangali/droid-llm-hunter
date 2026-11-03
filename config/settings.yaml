@@ -6,9 +6,12 @@ analysis:
   generate_exploit: false # Generate PoC scripts for vulnerabilities
   scan_libraries: false # If true, includes 3rd party libraries in scan scope.
   use_cross_reference_context: true # Use cross reference context
-  max_workers: 2 # [#6] Parallel deep-scan threads (raise for fast providers like Groq/Gemini)
+  max_workers: 4 # [#6] Parallel deep-scan threads. 4 is the safe default: measured clean on bbai with no 429/503. Raise to 8-16 only for providers with generous rate limits (Groq/Gemini)
+  summary_workers: 4 # Hybrid summarization threads (bounded 1-32; 1 restores serial execution). This is the DOMINANT lever on large APKs: summarization is 1 call per scoped candidate (1052 on Gojek) vs ~315 deep checks, so it outweighs max_workers
+  summary_batch_size: 1 # Experimental hybrid batching; 1 preserves established per-file behavior
+  hybrid_risk_triage: false # Skip redundant hybrid triage; true restores legacy priority behavior
   use_cache: true # [#4] Reuse identical LLM responses (resume after crash/rate-limit)
-  max_input_chars: 30000 # [#5] Truncate file content over this size before sending to LLM (0 = off)
+  max_input_chars: 32768 # [#5] Truncate file content over this size before sending to LLM (0 = off)
 
 # Apktool Configuration
 apktool:
@@ -20,7 +23,7 @@ jadx:
 
 # LLM Configuration
 llm:
-  provider: ollama # or "ollama" or "gemini" or "groq" or "openai" or "anthropic" or "openrouter" or "router9"
+  provider: codex # or "ollama" or "gemini" or "groq" or "openai" or "anthropic" or "openrouter" or "router9"
   anthropic_api_key: ANTHROPIC_API_KEY # Replace with your Anthropic API key
   anthropic_model: claude-sonnet-4-20250514 # default model for anthropic or "claude-sonnet-4-5-20250929"
   gemini_api_key: GEMINI_API_KEY # Replace with your Gemini API key
@@ -35,8 +38,8 @@ llm:
   openrouter_model: moonshotai/kimi-k3 #  default model for openrouter or "google/gemini-2.5-pro"
   router9_api_key: 9ROUTER_API_KEY # Replace with your 9Router API key
   router9_base_url: http://localhost:20128/v1/chat/completions # self-hosted; change host/port to match your instance
+  router9_timeout: 300 # seconds per call. Upstreams behind 9Router vary a lot; PoC generation was measured at ~104s, so the old hard-coded 120s cut off calls that were still working
   router9_model: cx/gpt-5.6-sol # default model for router9 (provider-prefixed, e.g. "gc/gemini-2.5-pro", "cx/gpt-5.6-sol"). If it's a reasoning model, raise max_tokens (reasoning tokens count against it)
-  exploit_provider: anthropic # --generate-exploit routed here (router9/jem-glm-5.2 returned empty for exploit-gen, confirmed live); reuses anthropic_api_key/anthropic_model above
   codex_model: gpt-daybreak-blue-latest # pin explicitly, do NOT leave null: the cache key falls back to the constant "codex:default", so changing the model in ~/.codex/config.toml would silently reuse the OLD model's cached answers. This model is described by Codex as "for broad defensive cybersecurity work" — the best fit here
   codex_cli_path: codex # path to the Codex CLI binary (must be on PATH, or give an absolute path — e.g. for cron/CI where PATH is minimal)
   codex_timeout: 300 # seconds per call. Real calls land at 7-12s; 300 leaves 25x headroom while still failing fast (3 retries x timeout is the worst case per file)
@@ -44,7 +47,7 @@ llm:
   codex_reasoning_effort: medium # none|low|medium|high|xhigh|max|ultra (verified live for this model; "minimal" is rejected by it). low/none give shallow verdicts; medium+ actually name the tainted source. Raise to high/xhigh for a final audit — changing it invalidates the cache for this provider, so the new level really re-runs
   exploit_provider: codex # --generate-exploit routed here (router9/jem-glm-5.2 returned empty for exploit-gen, confirmed live); reuses anthropic_api_key/anthropic_model above
   exploit_model: null # optional: override the model used for exploit-gen on exploit_provider (or on `provider`, if exploit_provider is unset)
-  max_tokens: 8192 # [#6] Max output tokens per LLM call (raise if JSON/exploit output gets cut off)
+  max_tokens: 32768 # [#6] Max output tokens per LLM call (raise if JSON/exploit output gets cut off)
 
 # Analysis Rules
 # Enable or disable specific vulnerability checks

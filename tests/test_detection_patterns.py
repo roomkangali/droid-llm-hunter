@@ -101,6 +101,19 @@ def test_fragment_injection_matches_both_java_and_smali():
     assert rx.search(".super Landroid/preference/PreferenceActivity;"), "must still match apktool/Smali"
 
 
+@pytest.mark.parametrize("snippet", [
+    # Existing signal forms must remain accepted.
+    'Intent fwd = (Intent) intent.getParcelableExtra("forward");',
+    'invoke-virtual {p0, v0}, Landroid/content/Intent;->getParcelableExtra(Ljava/lang/String;)Landroid/os/Parcelable;',
+    # Additive Bundle source coverage described by the rule prompt.
+    'Intent fwd = bundle.getParcelable("forward");',
+    'invoke-virtual {v0, v1}, Landroid/os/Bundle;->getParcelable(Ljava/lang/String;)Landroid/os/Parcelable;',
+])
+def test_intent_redirection_matches_existing_and_bundle_sources(snippet):
+    rx = re.compile(_load("intent_redirection")["detection_pattern"])
+    assert rx.search(snippet)
+
+
 @pytest.mark.parametrize("rule,benign", [
     ("fragment_injection", "public class X extends Activity {"),
     ("sql_injection", "int total = a + b;"),
@@ -119,7 +132,33 @@ def test_path_traversal_matches_real_read_signal():
     """v1.3.0 [D]: path_traversal must match the real signal (FileInputStream/ContentProvider openFile)."""
     rx = re.compile(_load("path_traversal")["detection_pattern"])
     assert rx.search("FileInputStream in = new FileInputStream(new File(dir, name));")
+    assert rx.search("FileOutputStream out = new FileOutputStream(target);")
     assert rx.search("public ParcelFileDescriptor openFile(Uri uri, String mode) {")
+
+
+@pytest.mark.parametrize("snippet", [
+    "File target = new File(baseDirectory, attackerControlledName);",
+    "invoke-direct {v0, v1, v2}, Ljava/io/File;-><init>(Ljava/io/File;Ljava/lang/String;)V",
+])
+def test_path_traversal_matches_file_constructor_java_and_smali(snippet):
+    rx = re.compile(_load("path_traversal")["detection_pattern"])
+    assert rx.search(snippet)
+
+
+def test_path_traversal_prompt_keeps_canonical_and_allowlist_verdict_context():
+    prompt = _load("path_traversal")["prompt"]
+    assert "getCanonicalPath" in prompt
+    assert "allowlist" in prompt
+
+
+@pytest.mark.parametrize("snippet", [
+    'db.rawQuery("SELECT * FROM users WHERE id=" + attacker, null);',
+    'db.execSQL("DELETE FROM users WHERE id=" + attacker);',
+    'db.query("users", columns, "name = " + attacker, null, null, null, null);',
+])
+def test_sql_injection_matches_existing_and_query_apis(snippet):
+    rx = re.compile(_load("sql_injection")["detection_pattern"])
+    assert rx.search(snippet)
 
 
 def test_insecure_file_permissions_covers_setreadable():
@@ -140,6 +179,22 @@ def test_pending_intent_matches_inlined_flag_mutable():
     assert rx.search("PendingIntent.getActivity(ctx, 0, i, PendingIntent.FLAG_MUTABLE);")
     # a non-mutable PendingIntent (immutable flag 67108864) must NOT match
     assert not rx.search("PendingIntent.getActivity(ctx, 0, i, 67108864);")
+
+
+def test_pending_intent_matches_real_smali_flag_before_invocation():
+    rx = re.compile(_load("pending_intent_hijacking")["detection_pattern"], re.IGNORECASE | re.DOTALL)
+    smali = """
+        const/high16 v3, 0x2000000
+        invoke-static {p0, v1, v2, v3}, Landroid/app/PendingIntent;->getActivity(Landroid/content/Context;ILandroid/content/Intent;I)Landroid/app/PendingIntent;
+    """
+    assert rx.search(smali)
+
+
+def test_pending_intent_matches_legacy_mutable_without_immutable_flag():
+    rx = re.compile(_load("pending_intent_hijacking")["detection_pattern"], re.IGNORECASE | re.DOTALL)
+    assert rx.search("PendingIntent.getBroadcast(ctx, 0, intent, 0);")
+    assert not rx.search("PendingIntent.getBroadcast(ctx, 0, intent, PendingIntent.FLAG_IMMUTABLE);")
+    assert not rx.search("PendingIntent.getService(ctx, 0, intent, 67108864);")
 
 
 def test_universal_logic_flaw_has_no_pattern():

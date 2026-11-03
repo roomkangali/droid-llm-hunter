@@ -5,6 +5,10 @@ prompt: |
   Specifically, look for Composable functions that might be vulnerable to screen capture.
   Check if `FLAG_SECURE` is used to prevent screen content from being captured.
 
+  Not vulnerable if the screen displays no sensitive data (no payment details, documents,
+  credentials, or OTP) — missing `FLAG_SECURE` is only a real gap on a screen that actually shows
+  something worth protecting from screenshots/screen-recording.
+
   Code:
   ```
   {code_snippet}

@@ -9,6 +9,10 @@ prompt: |
   - A malicious app can then SPOOF that Intent/broadcast to trigger a sensitive action (e.g. a fake
     "password reset" / state change), because the component trusts the action without verifying the sender.
 
+  Not vulnerable if the receiver verifies the sender's identity in code (e.g. checking the
+  broadcasting app's signature/UID) even without a manifest-level permission, or if the action
+  triggered by the Intent has no sensitive side effect.
+
   Recommend a signature-level permission, or `LocalBroadcastManager` for internal-only events.
 
   AndroidManifest.xml:

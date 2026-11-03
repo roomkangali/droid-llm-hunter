@@ -8,7 +8,12 @@ prompt: |
   - Weak validation logic, e.g., `url.startsWith("http")` (can be bypassed with `http.evil.com`).
   - Usage of sensitive parameters (auth tokens, user IDs) directly from the Deep Link without session verification.
   - Open Redirects: `intent.setData(Uri.parse(param))` or `webview.loadUrl(param)` without host validation.
-  
+
+  Not vulnerable if every sensitive parameter extracted from the deep link is re-validated
+  server-side (a real session/auth check) before use, or if the redirect/URL target is checked
+  with an exact host match against an allowlist (not `startsWith`/`contains`, which bypass via
+  `http.evil.com` or `trusted.com.evil.com`).
+
   Code to Analyze:
   ```
   {code_snippet}

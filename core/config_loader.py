@@ -27,6 +27,11 @@ class LLMSettings(BaseModel):
     router9_model: Optional[str] = None
     router9_api_key: Optional[str] = None
     router9_base_url: Optional[str] = "http://localhost:20128/v1/chat/completions"
+    # Seconds per call. 9Router fronts third-party upstreams whose latency varies wildly
+    # (PoC generation against a slow upstream has been measured at ~104s, and the same
+    # call failing upstream took 249s), so the old hard-coded 120s cut off work that was
+    # still progressing. Configurable, like codex_timeout.
+    router9_timeout: int = 300
     # Codex CLI (local agent binary, NOT an HTTP API — so no api_key here; auth comes from
     # the local `codex login`). Model is optional: unset means "use whatever
     # ~/.codex/config.toml already selects".
@@ -60,6 +65,9 @@ class AnalysisSettings(BaseModel):
     generate_exploit: bool = False
     scan_libraries: bool = False # [New V1.1.7]
     max_workers: int = 2          # [#6] Parallel deep-scan threads
+    summary_workers: int = Field(default=2, ge=1, le=32)  # Bounded; used starting in hybrid Phase 2
+    summary_batch_size: int = Field(default=1, ge=1, le=32)  # Experimental; 1 preserves per-item calls
+    hybrid_risk_triage: bool = False  # False skips redundant hybrid triage; true restores legacy ordering
     use_cache: bool = True        # [#4] Reuse identical LLM responses (resume-friendly)
     max_input_chars: int = 30000  # [#5] Truncate oversized file content before sending to LLM
  # Default to True for backward compatibility

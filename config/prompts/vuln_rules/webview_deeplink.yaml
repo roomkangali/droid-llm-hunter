@@ -10,6 +10,10 @@ prompt: |
     parameter, etc.) into `webView.loadUrl(...)` WITHOUT validating scheme/host against an allowlist,
     an attacker can drive the WebView to arbitrary content (open redirect / XSS / phishing).
 
+  Not vulnerable if the URL loaded into the WebView is always a value this app controls (a
+  hardcoded host, or a path within the app's own bundled assets) and never derived from the
+  incoming Intent/deep-link data.
+
   Recommend validating scheme + host before loading, and disabling unneeded WebView features.
 
   AndroidManifest.xml:

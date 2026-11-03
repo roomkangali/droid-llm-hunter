@@ -30,16 +30,16 @@ Used during the `llm_only` or `hybrid` filtering phase. Its task is to condense 
 *   **[NEW]** Explicitly instructed to look for sensitive categories (MASVS-AUTH, MASVS-CRYPTO, MASVS-NETWORK, etc.).
 *   **Output:** Descriptive summaries containing "Tags/Signals" for the next phase.
 
-### 3. `identify_risk_prompt.txt` (Phase 2: The Gatekeeper)
+### 3. `identify_risk_prompt.txt` (Optional Legacy Priority Classifier)
 **Location:** `config/prompts/identify_risk_prompt.txt`
 **Function:** 
-Acts as an intelligent filter. The AI reads the *summaries* (from Phase 1) and decides whether the file is worth a deeper scan (Deep Scan) or should be discarded (Safe/Noise).
+Reads summaries and returns a coarse `YES`/`NO` risk vote. In the current hybrid default (`hybrid_risk_triage: false`) this call is skipped because exhaustive selection already sends every scoped candidate to deep scan.
 **Key Roles:**
-*   **[NEW]** Matches "Tags/Signals" from the summary against a Trigger List.
+*   Matches "Tags/Signals" from the summary against a Trigger List.
 *   If the summary contains MASVS keywords -> Risk = **YES**.
 *   If the summary only contains common UI/Utility code -> Risk = **NO**.
-*   **Token Efficiency:** Prevents irrelevant files from entering the expensive Phase 3.
-*   **[v1.3.0] Recall safeguard:** a coarse "NO" here cannot hide a strong static signal — first-party files whose content matches an enabled rule's `detection_pattern` are deep-scanned anyway (`Engine._pattern_matched_files`). So this gate only ever *adds* scan candidates on top of the pattern hits, it never removes one.
+*   **Ordering only:** when explicitly re-enabled for A/B or rollback, `YES` files may be prioritized, but `NO`, empty, timeout, or malformed responses cannot remove a candidate. `_select_deep_scan_targets()` always appends the full scoped candidate list.
+*   A triage failure is recorded rather than interpreted as safe.
 
 ### 4. `app_summary_prompt.txt` (Reporting: The Big Picture)
 **Location:** `config/prompts/app_summary_prompt.txt`
@@ -64,11 +64,11 @@ Used if the `generate_attack_surface_map` option is enabled. Its task is to map 
 ### 6. `vuln_rules/*.yaml` (Phase 3: The Detectors)
 **Location:** `config/prompts/vuln_rules/*.yaml`
 **Function:**
-One file per vulnerability rule. Each supplies the `prompt` shown to the LLM during Deep Analysis, plus an optional `detection_pattern` (regex) and `keywords` used by the static filter to decide whether the rule even runs (per-rule gating).
+One file per vulnerability rule. Each supplies the `prompt` shown to the LLM during Deep Analysis, plus optional `detection_pattern` (regex), `static_analysis.patterns`, and `keywords` used for candidate discovery and file-rule routing.
 **Key Roles:**
 *   **[v1.3.0] Consistent template:** every rule follows *Vulnerability pattern → Tainted source → "not a finding if…"*, so the model reasons about attacker-controllability, not just keyword presence.
 *   **[v1.3.0] Language-agnostic:** prompts say "decompiled Android code (Java or Smali)" with a neutral ```` ``` ```` code fence — no per-file `smali→java` string patching anymore.
-*   **[v1.3.0] Per-rule gating:** in `hybrid`/`static_only` modes a rule's LLM call is skipped when its `detection_pattern` doesn't match the file (huge token saving). Pattern-less rules (e.g. `universal_logic_flaw`, deliberately LLM-exclusive) always run on risky files.
+*   **Per-rule routing:** in `hybrid`/`static_only` modes a rule's LLM call is skipped when none of that rule's patterns match the file. Pattern-less logic rules (for example `universal_logic_flaw`) always run on every scheduled candidate. Invalid regex fails open and runs the LLM.
 *   **Manifest rules** (`exported_components`, `intent_spoofing`, `deeplink_hijack`, `webview_deeplink`, `strandhogg`) run only against `AndroidManifest.xml`, never the code scan (single-source `MANIFEST_RULES`).
 *   **[v1.3.0] 26 toggleable rules** (A–Z in `RulesSettings`), including the new `intent_redirection` (confused-deputy IPC). A separate `library_vulnerability` supply-chain detector runs only under `--scan-libraries`.
 *   **Output:** the structured JSON defined by the system prompt; overlapping findings on the same file are later collapsed via report de-duplication (`also_detected_by`).
@@ -83,25 +83,30 @@ The following diagram illustrates how these prompts interact sequentially during
 [ START SCAN ]
       |
       v
-[ PHASE 1: SUMMARIZATION ]
-(Used for all code chunks)
+[ PHASE 1: CANDIDATE DISCOVERY + SCOPE ]
+Hybrid/static: enabled-rule keyword OR regex
+LLM-only: complete code tree
+      |
+      v
+[ PHASE 2: SUMMARIZATION ]
+(Hybrid/LLM-only; hybrid uses bounded workers)
 Prompt: `summarize_prompt.txt`
 Input : "Raw Code (Java/Smali)"
 Output: "Summary + MASVS Tags"
       |
       v
-[ PHASE 2: FILTERING (Risk Logic) ]
-(Used to decide file fate)
+[ OPTIONAL LEGACY RISK PRIORITY ]
+(Skipped by default in hybrid; never decides membership)
 Prompt: `identify_risk_prompt.txt`
 Input : "Summary + MASVS Tags"
-Output: "YES" (Proceed) or "NO" (Discard)
+Output: "YES" / "NO" ordering signal
       |
       v
 [ PHASE 3: DEEP ANALYSIS (Vulnerability Scan) ]
-(Only for "YES" risky files)
+(Every scoped hybrid candidate; static hits first)
 Prompt: `system_prompt.txt` (Persona + MASVS Definition) + `vuln_rules/*.yaml`
 Input : "Raw Code" + "Context"
-Output: JSON Vulnerability Report
+Output: JSON verdict or Error/Unanalyzed
       |
       v
 [ PHASE 4: REPORTING ]

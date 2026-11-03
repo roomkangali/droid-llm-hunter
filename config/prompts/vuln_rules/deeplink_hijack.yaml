@@ -10,6 +10,10 @@ prompt: |
   - A malicious app can register the same scheme/host and hijack the link (intercept tokens,
     phishing). If the target activity then redirects using the link data, it is also an open redirect.
 
+  Not vulnerable if `android:autoVerify="true"` is set together with a specific, non-wildcard host
+  (backed by a valid Digital Asset Links / `assetlinks.json`), or if the activity reached by the
+  link performs no sensitive action and never redirects using attacker-supplied link data.
+
   Recommend Android App Links (`autoVerify="true"` + Digital Asset Links) and strict scheme/host checks.
 
   AndroidManifest.xml:

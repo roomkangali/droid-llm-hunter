@@ -9,15 +9,16 @@
 Droid LLM Hunter uses a multi-stage process to analyze an APK:
 
 1.  **Decompilation:** The APK is decompiled using **Apktool** (for Smali/Manifest) and optionally **JADX** (for Java Source), depending on the `decompiler_mode`.
-2.  **Smart Filtering:** Based on the `filter_mode`, the engine identifies potentially risky files using Static Analysis (`static_only`), AI Summarization (`llm_only`), or both (`hybrid`).
-3.  **Smart Scope Protection:** Irrelevant files (libraries) are discarded based on `package` name and blocklists.
-4.  **Risk Identification:** High-level analysis determines which files require deep inspection. **[v1.3.0]** As a recall safeguard, first-party files whose content matches an enabled rule's `detection_pattern` skip this triage and are always deep-scanned (a strong static signal is never dropped).
-5.  **Deep Dive Analysis:** Risky files are scanned for vulnerabilities.
-6.  **Global Context Building:** All findings are summarized to create a "Global Context".
-7.  **Chained Exploit Generation:** The engine generates exploits that leverage the Global Context to connect vulnerabilities across files.
-8.  **Enrichment & Reporting:** Vulnerabilities are mapped to **OWASP MASVS** standards, and a detailed JSON report is generated.
+2.  **Candidate Discovery:** `static_only` and `hybrid` collect the union of enabled-rule keyword/regex signals; `llm_only` starts from the complete code tree.
+3.  **Smart Scope Protection:** Irrelevant/library paths are removed using package context and blocklists. `--scan-libraries` additively restores library-hunting candidates.
+4.  **Context Preparation:** Hybrid summarizes every scoped candidate with bounded workers, then restores stable order for cross-reference/app context. Summary failures are recorded and fail open.
+5.  **Exhaustive Scheduling:** Hybrid prioritizes static-pattern hits, appends every remaining scoped candidate, and submits the full queue. Optional legacy risk-triage can affect ordering only; it cannot remove candidates.
+6.  **Deep Rule Analysis:** Applicable active rule/file pairs are analyzed by the LLM. Every started check must produce a verdict or an `Error/Unanalyzed` record.
+7.  **Global Context Building:** Findings and application context are assembled for reporting/exploit generation.
+8.  **Chained Exploit Generation:** If explicitly enabled, PoCs use the Global Context to connect vulnerabilities across files. PoC validation status never deletes the underlying finding.
+9.  **Enrichment & Reporting:** Findings are mapped to **OWASP MASVS**, all scheduled work is reconciled, and the JSON report is generated.
 
-> **💾 Response Cache (cross-cutting):** Every LLM call in the stages above — summarization, risk identification, deep-scan verification, app summary, and exploit generation — passes through a content-addressed cache first. A HIT returns the stored answer for free; a MISS calls the LLM and stores the successful result. This makes an interrupted scan resume for free on re-run. See [Configuration](CONFIGURATION.md#response-cache-analysisuse_cache).
+> **💾 Response Cache (cross-cutting):** Every LLM call in the stages above—summarization, optional legacy risk identification, deep-rule verification, app summary, attack-surface mapping, and exploit generation—passes through a content-addressed cache first. A hit avoids a provider call but does not remove the candidate from scheduling/accounting. See [Configuration](CONFIGURATION.md#response-cache-analysisuse_cache).
 
 ---
 

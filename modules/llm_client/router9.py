@@ -27,11 +27,13 @@ class Router9Client(BaseLLMClient):
     sniffs the response body itself to decide whether it's SSE or a plain JSON object.
     """
 
-    def __init__(self, model: str, api_key: str, base_url: str, max_tokens: int = 4096):
+    def __init__(self, model: str, api_key: str, base_url: str, max_tokens: int = 4096,
+                 timeout: int = 300):
         self.model = model
         self.api_key = api_key
         self.max_tokens = max_tokens
         self.url = base_url
+        self.timeout = timeout
 
     def analyze_code(self, code_snippet: str, context: Dict[str, Any]) -> str:
         prompt = self._construct_prompt(code_snippet, context)
@@ -61,7 +63,7 @@ class Router9Client(BaseLLMClient):
                     self.url,
                     headers=headers,
                     json=data,
-                    timeout=120,
+                    timeout=self.timeout,
                     stream=True,
                 ) as response:
 
@@ -73,7 +75,32 @@ class Router9Client(BaseLLMClient):
                     response.raise_for_status()
 
                     body = response.text
-                    content = self._extract_content(body)
+                    content, finish_reason = self._extract_content_and_reason(body)
+
+                if finish_reason == "length":
+                    # Deterministic: retrying with the same budget truncates again. Fail
+                    # loudly with the fix instead of handing the engine a stub — a
+                    # reasoning model spent 8190 of 8192 tokens thinking and returned a
+                    # single character, which was then saved as a "PoC".
+                    log.error(
+                        f"9Router response was TRUNCATED by max_tokens "
+                        f"({self.max_tokens}); only {len(content)} char(s) of answer "
+                        f"survived. Raise llm.max_tokens — reasoning models spend most "
+                        f"of the budget on hidden reasoning before answering."
+                    )
+                    return ""
+
+                if finish_reason is None and content:
+                    # Stream ended without ever reporting why: treat as a dropped
+                    # connection and let the retry loop have another go rather than
+                    # passing a partial answer off as complete.
+                    log.warning(
+                        f"9Router stream ended without a finish_reason after "
+                        f"{len(content)} char(s); treating as incomplete and retrying."
+                    )
+                    time.sleep(base_delay * (2 ** attempt))
+                    continue
+
                 if content:
                     log.success("Received analysis from 9Router.")
                 return content
@@ -86,18 +113,34 @@ class Router9Client(BaseLLMClient):
         return ""
 
     def _extract_content(self, body: str) -> str:
+        """Content only. Kept for callers that don't care why generation stopped."""
+        return self._extract_content_and_reason(body)[0]
+
+    def _extract_content_and_reason(self, body: str):
         """Sniffs the response body to tell an SSE stream apart from a plain JSON object
         (the `Content-Type` header can't be trusted to say which one it actually is —
-        see class docstring)."""
+        see class docstring), and reports why generation stopped.
+
+        The reason matters: a reasoning model can burn its whole budget on hidden
+        `reasoning_content` and return a 1-character answer with
+        ``finish_reason: "length"``. Without this the client logs SUCCESS and hands the
+        engine a truncated artifact — observed saving "#!/" as a PoC script. Returns
+        ``(content, finish_reason)`` where finish_reason is None when the stream ended
+        without one (a dropped connection).
+        """
         stripped = body.lstrip()
         if stripped.startswith("data:"):
-            return self._parse_sse_stream(stripped)
-        return self._parse_plain_json(stripped)
+            return self._parse_sse_stream_with_reason(stripped)
+        return self._parse_plain_json_with_reason(stripped)
 
     def _parse_sse_stream(self, body: str) -> str:
+        return self._parse_sse_stream_with_reason(body)[0]
+
+    def _parse_sse_stream_with_reason(self, body: str):
         """Accumulates `delta.content` fragments from an OpenAI-style SSE stream
         (`data: {...}` lines, terminated by `data: [DONE]`)."""
         chunks = []
+        finish_reason = None
         for raw_line in body.splitlines():
             raw_line = raw_line.strip()
             if not raw_line or not raw_line.startswith("data:"):
@@ -115,13 +158,18 @@ class Router9Client(BaseLLMClient):
             choices = event.get("choices") or []
             if not choices:
                 continue
+            if choices[0].get("finish_reason"):
+                finish_reason = choices[0]["finish_reason"]
             delta = choices[0].get("delta") or {}
             piece = delta.get("content")
             if piece:
                 chunks.append(piece)
-        return "".join(chunks)
+        return "".join(chunks), finish_reason
 
     def _parse_plain_json(self, body: str) -> str:
+        return self._parse_plain_json_with_reason(body)[0]
+
+    def _parse_plain_json_with_reason(self, body: str):
         """Parses a single `chat.completion` JSON object, tolerating trailing garbage
         (9Router has been observed appending a stray `data: [DONE]` directly after the
         JSON with no separator)."""
@@ -129,20 +177,25 @@ class Router9Client(BaseLLMClient):
             result, _ = json.JSONDecoder().raw_decode(body)
         except json.JSONDecodeError as e:
             log.error(f"9Router returned unparseable response: {e}")
-            return ""
+            return "", None
         if "error" in result:
             log.error(f"9Router API returned error: {result['error']}")
             raise requests.exceptions.RequestException(f"9Router API Error: {result['error']}")
         choices = result.get("choices") or []
-        return choices[0]["message"]["content"] if choices else ""
+        if not choices:
+            return "", None
+        return choices[0].get("message", {}).get("content", ""), choices[0].get("finish_reason")
 
     def _construct_prompt(self, code_snippet: str, context: Dict[str, Any]) -> str:
         system_prompt = context.get("system_prompt", "")
         vuln_prompt = context.get("vuln_prompt", "")
 
-        formatted_prompt = vuln_prompt.format(
-            code_snippet=code_snippet,
-            file_path=context.get("file_path", "N/A")
-        )
+        # .replace() rather than .format(): a rule prompt (or the code snippet spliced
+        # into it) can legitimately contain literal braces — a JSON example in the
+        # prompt, or decompiled Java/Kotlin — and .format() would read those as
+        # placeholders and raise KeyError/IndexError mid-scan. Matches openrouter.py
+        # and codex.py.
+        formatted_prompt = vuln_prompt.replace("{code_snippet}", code_snippet)
+        formatted_prompt = formatted_prompt.replace("{file_path}", context.get("file_path", "N/A"))
 
         return f"{system_prompt}\n\n{formatted_prompt}"

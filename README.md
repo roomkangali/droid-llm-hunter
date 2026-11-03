@@ -2,7 +2,7 @@
 
 **Droid LLM Hunter** is an automated security analysis tool designed to detect vulnerabilities in Android applications with high precision. By combining traditional static analysis (SAST) with the contextual understanding of **Large Language Models (LLMs)**, it bridges the gap between keyword-based scanning and human-like code review.
 
-It supports **Hybrid Decompilation** (Smali/Java), **Context-Aware Analysis** (Call Graphs), and **Intelligent Risk Filtering**, ensuring that security engineers can focus on verified, high-severity findings rather than false positives.
+It supports **Hybrid Decompilation** (Smali/Java), **Context-Aware Analysis** (Call Graphs), and **Exhaustive Hybrid Scheduling**. In hybrid mode, static signals discover the scoped candidate set, high-signal files are prioritized, and every scoped candidate still reaches deep rule analysis—priority is never a top-N or score gate.
 
 Features **Auto-Exploit Generation**, transforming from a passive scanner into an active **Red Team Assistant** capable of verifying vulnerabilities with generated Proof-of-Concept (PoC) scripts.
 
@@ -96,7 +96,7 @@ Features **Auto-Exploit Generation**, transforming from a passive scanner into a
 
 ## ✨ Features
 
-Droid LLM Hunter combines static analysis with LLM intelligence to detect Android vulnerabilities with high precision. Key capabilities include Staged Prompt Architecture, Hybrid Filter Modes, Call Graph Context Injection, OWASP MASVS enrichment, and Auto-Exploit Generation across 8 LLM providers (including **9Router**, a self-hosted multi-provider router, and **Codex CLI**, a local agent binary that needs no API key).
+Droid LLM Hunter combines static analysis with LLM intelligence to detect Android vulnerabilities with high precision. Key capabilities include Staged Prompt Architecture, exhaustive Hybrid Filter Mode, bounded parallel summarization, Call Graph Context Injection, OWASP MASVS enrichment, honest `Error/Unanalyzed` reporting, and Auto-Exploit Generation across 8 LLM providers (including **9Router**, a self-hosted multi-provider router, and **Codex CLI**, a local agent binary that needs no API key).
 
 → **[View Full Feature List](document/FEATURES.md)**
 
@@ -104,7 +104,7 @@ Droid LLM Hunter combines static analysis with LLM intelligence to detect Androi
 
 ## 🔄 Scan Workflow
 
-Multi-stage pipeline: **Decompilation → Scope Filter → Risk Identification → Deep Scan → Global Context → Chained Exploit → Report**.
+Multi-stage pipeline: **Decompilation → Rule-Signal Discovery → Scope Filter → Parallel Summarization → Exhaustive Priority Queue → Deep Rule Analysis → Global Context → Chained Exploit → Report**.
 
 → **[View Full Pipeline Diagram & Explanation](document/SCAN-WORKFLOW.md)**
 
@@ -145,7 +145,7 @@ Multi-stage pipeline: **Decompilation → Scope Filter → Risk Identification �
 
 | Setting | Options | Recommended |
 |---------|---------|-------------|
-| `filter_mode` | `llm_only`, `static_only`, `hybrid` | `hybrid` |
+| `filter_mode` | `llm_only`, `static_only`, `hybrid` | `hybrid` for contextual audit; `static_only` for a large first pass |
 | `decompiler_mode` | `apktool`, `jadx`, `hybrid` | `hybrid` |
 | `provider` | `ollama`, `gemini`, `groq`, `openai`, `anthropic`, `openrouter`, `router9`, `codex` | `anthropic` |
 

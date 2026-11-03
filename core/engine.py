@@ -16,8 +16,16 @@ from core.manifest_parser import ManifestParser
 import os
 import yaml
 import concurrent.futures
+import threading
+import tempfile
+import stat
 import zipfile
 import shutil
+import ast
+import re
+import subprocess
+import time
+from html.parser import HTMLParser
 from rich.progress import track
 from core.logger import console
 
@@ -47,6 +55,10 @@ VULN_FAMILIES = {
 # is the ONLY finding on a file, it stays as a standalone finding.
 GENERIC_RULES = {"universal_logic_flaw"}
 _SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+POC_STATUSES = frozenset({
+    "generated", "validation-error", "execution-error", "reproduced",
+    "not-reproduced", "Unanalyzed",
+})
 
 # [#C] Appended to every RULE prompt (deep-scan + manifest + strings) as the LAST instruction,
 # so it overrides any prose-inviting wording inside a rule ("explain...", "say Safe"). Reduces
@@ -60,6 +72,13 @@ JSON_ONLY_SUFFIX = (
     "and the remediation in recommendation."
 )
 
+SUMMARY_BATCH_SUFFIX = (
+    "\n\n### BATCH OUTPUT CONTRACT\n"
+    "The input is a JSON object with an items array. Summarize every item independently. "
+    "Return ONLY one JSON object mapping each opaque id to a non-empty summary string. "
+    "Every input id must appear exactly once. Do not add, rename, infer, or omit ids."
+)
+
 class Engine:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -69,6 +88,9 @@ class Engine:
         
         self.apk_name = "target_app" # Default fallback
         self.vulnerability_findings = []
+        # PoC generation/verification has its own lifecycle. Its failures must not
+        # downgrade or remove the static vulnerability finding.
+        self.poc_results = []
         self.analysis_errors = []  # [FIX #2] Files/rules that failed LLM analysis (NOT clean)
         
         # Load Call Graph Builder if enabled
@@ -156,6 +178,7 @@ class Engine:
                 api_key=self.settings.llm.router9_api_key,
                 base_url=self.settings.llm.router9_base_url,
                 max_tokens=max_tokens,
+                timeout=self.settings.llm.router9_timeout,
             )
         elif provider == "codex":
             # Local CLI agent, not an HTTP API: no api_key, and `model` may legitimately
@@ -183,10 +206,20 @@ class Engine:
         return CachedLLMClient(raw_client, cache_dir, model=model, enabled=self.settings.analysis.use_cache)
 
     def get_status(self, result: dict) -> str:
-        """Determines status from the structured JSON result."""
-        if result.get("is_vulnerable"):
+        """Return a verdict only when ``is_vulnerable`` is an actual JSON boolean.
+
+        Truthiness is unsafe here: ``"false"`` used to become Vulnerable, while a
+        missing field, ``null``, or ``0`` became Not Vulnerable.  Invalid verdicts
+        are analysis failures and must never be interpreted as a clean result.
+        """
+        if not isinstance(result, dict):
+            return "Error"
+        value = result.get("is_vulnerable")
+        if value is True:
             return "Vulnerable"
-        return "Not Vulnerable"
+        if value is False:
+            return "Not Vulnerable"
+        return "Error"
 
     def _rule_should_run(self, rule_name: str, prompt_data: dict, content: str) -> bool:
         """
@@ -244,7 +277,15 @@ class Engine:
             + text[-tail_len:]
         )
 
-    def _build_error_result(self, file_path: str, rule_name: str, vuln_name: str, reason: str = "empty") -> dict:
+    def _build_error_result(
+        self,
+        file_path: str,
+        rule_name: str,
+        vuln_name: str,
+        reason: str = "empty",
+        raw_response: str = "",
+        detail: str = "",
+    ) -> dict:
         """
         [FIX #2 / B] Report entry for a rule/file that could NOT be analyzed (not clean).
 
@@ -253,26 +294,205 @@ class Engine:
           "unparseable" -> LLM returned non-empty output that was not valid JSON
                            (common with local models that answer in prose instead of JSON).
         """
-        self.analysis_errors.append({"file": file_path, "rule": rule_name, "reason": reason})
+        if not hasattr(self, "analysis_errors"):
+            self.analysis_errors = []
+        error_entry = {
+            "file": file_path,
+            "rule": rule_name,
+            "stage": "rule_analysis",
+            "status": "Unanalyzed",
+            "reason": reason,
+        }
+        if raw_response:
+            error_entry["raw_response"] = raw_response
+        if detail:
+            error_entry["detail"] = detail
+        self.analysis_errors.append(error_entry)
         if reason == "unparseable":
             error_msg = ("LLM returned unparseable output (not valid JSON — likely prose, "
                          "common with small local models). This file/rule was NOT verified — "
                          "treat as unanalyzed, not clean.")
+        elif reason == "invalid_verdict":
+            error_msg = ("LLM returned JSON with a missing or non-boolean 'is_vulnerable' field. "
+                         "This file/rule was NOT verified — treat as unanalyzed, not clean.")
+        elif reason == "timeout":
+            error_msg = ("LLM analysis timed out. This file/rule was NOT verified — "
+                         "treat as unanalyzed, not clean.")
+        elif reason == "exception":
+            error_msg = ("LLM analysis raised an exception. This file/rule was NOT verified — "
+                         "treat as unanalyzed, not clean.")
         else:
             error_msg = ("LLM analysis failed (empty response after retries). "
                          "This file/rule was NOT verified — treat as unanalyzed, not clean.")
-        return {
+        error_result = {
             "file": file_path,
             "rule": rule_name,
             "vulnerability": vuln_name,
             "status": "Error",
             "result": {
-                "is_vulnerable": False,
+                "is_vulnerable": None,
                 "status_detail": "UNANALYZED",
                 "error": error_msg,
                 "description": "Analysis could not be completed for this rule.",
             },
         }
+        if raw_response:
+            error_result["result"]["raw_response"] = raw_response
+        return error_result
+
+    def _record_pipeline_error(
+        self,
+        file_path: str,
+        stage: str,
+        reason: str,
+        detail: str = "",
+        raw_response: str = "",
+        status: str = "Unanalyzed",
+    ):
+        """Record a pre-analysis failure without classifying the candidate as clean."""
+        if not hasattr(self, "analysis_errors"):
+            self.analysis_errors = []
+        entry = {
+            "file": file_path,
+            "rule": f"__{stage}__",
+            "stage": stage,
+            "status": status,
+            "reason": reason,
+        }
+        if detail:
+            entry["detail"] = detail
+        if raw_response:
+            entry["raw_response"] = raw_response
+        self.analysis_errors.append(entry)
+
+    def _collect_cache_errors(self):
+        """Copy non-fatal cache I/O/fingerprint failures into the scan audit trail."""
+        seen_clients = set()
+        for client in (self.llm_client, self.exploit_llm_client):
+            client_id = id(client)
+            if client_id in seen_clients or not hasattr(client, "cache_stats"):
+                continue
+            seen_clients.add(client_id)
+            for error in client.cache_stats().get("errors", []):
+                operation = error.get("operation", "unknown")
+                self._record_pipeline_error(
+                    error.get("path") or getattr(self, "apk_name", ""),
+                    "cache",
+                    operation,
+                    error.get("detail", ""),
+                    status="Error",
+                )
+
+    def _metric_add(self, name: str, amount: int = 1):
+        """Update observability counters without participating in scan decisions."""
+        metrics = getattr(self, "scan_metrics", None)
+        if metrics is None:
+            return
+        lock = getattr(self, "_metrics_lock", None)
+        if lock is None:
+            metrics[name] = metrics.get(name, 0) + amount
+            return
+        with lock:
+            metrics[name] = metrics.get(name, 0) + amount
+
+    @staticmethod
+    def _metric_timer_start():
+        """Best-effort monotonic start time; metrics must never break a scan."""
+        try:
+            return time.monotonic()
+        except Exception as exc:
+            log.debug(f"Could not start stage timer: {exc}")
+            return None
+
+    def _metric_record_duration(self, name: str, started_at):
+        """Store a stage duration without exposing it to scan decisions."""
+        if started_at is None:
+            return
+        try:
+            duration = max(0.0, time.monotonic() - started_at)
+            metrics = getattr(self, "scan_metrics", None)
+            if metrics is None:
+                return
+            lock = getattr(self, "_metrics_lock", None)
+            if lock is None:
+                metrics[name] = duration
+                return
+            with lock:
+                metrics[name] = duration
+        except Exception as exc:
+            log.debug(f"Could not record stage timer '{name}': {exc}")
+
+    def _record_deep_rule_outcome(self, status: str):
+        """Account for one started deep-rule LLM check without affecting its verdict."""
+        self._metric_add("deep_rule_checks_accounted")
+        if status == "Vulnerable":
+            self._metric_add("deep_rule_checks_completed")
+            self._metric_add("deep_rule_checks_vulnerable")
+        elif status == "Not Vulnerable":
+            self._metric_add("deep_rule_checks_completed")
+            self._metric_add("deep_rule_checks_not_vulnerable")
+        else:
+            self._metric_add("deep_rule_checks_error")
+
+    def _combined_cache_stats(self) -> dict:
+        """Return combined scan/exploit cache counters without mutating the pipeline."""
+        hits = 0
+        misses = 0
+        enabled = False
+        seen_clients = set()
+        for client in (self.llm_client, self.exploit_llm_client):
+            client_id = id(client)
+            if client_id in seen_clients or not hasattr(client, "cache_stats"):
+                continue
+            seen_clients.add(client_id)
+            stats = client.cache_stats()
+            hits += stats.get("hits", 0)
+            misses += stats.get("misses", 0)
+            enabled = enabled or bool(stats.get("enabled"))
+        return {"hits": hits, "misses": misses, "enabled": enabled}
+
+    def _finalize_scan_metrics(self, results: list):
+        """Derive report-only counters after all analysis decisions are complete."""
+        if not hasattr(self, "scan_metrics"):
+            return
+        statuses = {"Vulnerable": 0, "Not Vulnerable": 0, "Error": 0}
+        for result in results:
+            status = result.get("status")
+            statuses[status] = statuses.get(status, 0) + 1
+        cache = self._combined_cache_stats()
+        self.scan_metrics.update({
+            "report_results": len(results),
+            "vulnerable_results": statuses.get("Vulnerable", 0),
+            "not_vulnerable_results": statuses.get("Not Vulnerable", 0),
+            "error_results": statuses.get("Error", 0),
+            "analysis_errors": len(self.analysis_errors),
+            "cache_hits": cache["hits"],
+            "cache_misses": cache["misses"],
+            "cache_enabled": cache["enabled"],
+        })
+        by_stage = {}
+        for error in self.analysis_errors:
+            stage = error.get("stage", "unknown")
+            by_stage[stage] = by_stage.get(stage, 0) + 1
+        self.scan_metrics["errors_by_stage"] = by_stage
+
+    def _write_failed_scan_report(self):
+        """Persist a fatal early-stage failure so it cannot look like a clean scan."""
+        self._collect_cache_errors()
+        self._finalize_scan_metrics([])
+        report = {
+            "scan_status": "Error",
+            "app_summary": "",
+            "attack_surface_map": None,
+            "results": [],
+            "poc_results": getattr(self, "poc_results", []),
+            "analysis_errors": self.analysis_errors,
+            "scan_metrics": getattr(self, "scan_metrics", {}),
+        }
+        with open(self.final_output_file, "w") as f:
+            import json
+            json.dump(report, f, indent=2)
+        log.error(f"Scan failed. Partial error report saved to {self.final_output_file}")
 
     def _dedupe_findings(self, results: list) -> list:
         """
@@ -337,6 +557,111 @@ class Engine:
 
         return passthrough + deduped
 
+    # Archive formats that contain one or more APKs rather than being APKs themselves.
+    BUNDLE_EXTENSIONS = (".xapk", ".apks")
+
+    @staticmethod
+    def _rank_bundle_apk(name: str) -> int:
+        """Rank an APK inside a bundle; lower values are preferred."""
+        name = name.lower()
+        if name == "universal.apk":
+            return 0
+        if name in ("base-master.apk", "base.apk"):
+            return 1
+        if name.endswith("-master.apk"):
+            return 2
+        if name.startswith("config.") or ".config." in name or name.startswith("split_config."):
+            return 4
+        return 3
+
+    def _select_bundle_apk(self, extract_dir: str) -> str:
+        """Select the best analyzable APK from an extracted XAPK/APKS bundle."""
+        candidates = []
+        for root, _, files in os.walk(extract_dir):
+            for filename in files:
+                if filename.lower().endswith(".apk"):
+                    full_path = os.path.join(root, filename)
+                    candidates.append((
+                        self._rank_bundle_apk(filename),
+                        -os.path.getsize(full_path),
+                        full_path,
+                    ))
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][2]
+
+    @staticmethod
+    def _safe_extract_bundle(archive_path: str, extract_dir: str):
+        """Extract a bundle without allowing archive members to escape its temp dir."""
+        root = os.path.realpath(extract_dir)
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            members = archive.infolist()
+            for member in members:
+                normalized_name = member.filename.replace("\\", "/")
+                destination = os.path.realpath(os.path.join(root, normalized_name))
+                if os.path.commonpath((root, destination)) != root:
+                    raise ValueError(f"unsafe archive path: {member.filename}")
+                unix_mode = member.external_attr >> 16
+                if stat.S_ISLNK(unix_mode):
+                    raise ValueError(f"archive symlink is not allowed: {member.filename}")
+            archive.extractall(root, members)
+
+    @staticmethod
+    def _describe_decompile_dir(path: str) -> str:
+        """Describe why a decompiled tree cannot safely be treated as analyzed."""
+        if not os.path.isdir(path):
+            return "the directory does not exist"
+        entries = os.listdir(path)
+        if not entries:
+            return "the directory is empty"
+        smali_count = sum(
+            sum(1 for filename in files if filename.endswith(".smali"))
+            for _, _, files in os.walk(path)
+        )
+        if smali_count:
+            return (
+                f"it holds {smali_count} .smali files but no AndroidManifest.xml — "
+                "the decompile appears incomplete"
+            )
+        if "unknown" in entries and len(entries) <= 2:
+            return "apktool produced only unknown/, indicating an unreadable input archive"
+        return (
+            "it contains no AndroidManifest.xml "
+            f"(top-level entries: {', '.join(sorted(entries)[:6])})"
+        )
+
+    def _publish_decompile(self, staging_dir: str, output_dir: str, apk_path: str) -> bool:
+        """Atomically promote a complete staging tree while preserving the old tree on failure."""
+        required = ("AndroidManifest.xml", "apktool.yml")
+        missing = [name for name in required if not os.path.exists(os.path.join(staging_dir, name))]
+        if missing:
+            log.error(
+                f"Decompilation of '{apk_path}' is incomplete; missing: {', '.join(missing)}. "
+                f"{self._describe_decompile_dir(staging_dir)}."
+            )
+            if os.path.exists(os.path.join(output_dir, "AndroidManifest.xml")):
+                log.warning(f"Keeping previous usable decompile in '{output_dir}'.")
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return False
+
+        previous_dir = f"{output_dir}.old"
+        shutil.rmtree(previous_dir, ignore_errors=True)
+        try:
+            if os.path.exists(output_dir):
+                os.rename(output_dir, previous_dir)
+            os.rename(staging_dir, output_dir)
+        except OSError as exc:
+            log.error(f"Could not publish decompiled output: {exc}")
+            if not os.path.exists(output_dir) and os.path.exists(previous_dir):
+                try:
+                    os.rename(previous_dir, output_dir)
+                except OSError as rollback_exc:
+                    log.error(f"Could not restore previous decompile: {rollback_exc}")
+            return False
+        shutil.rmtree(previous_dir, ignore_errors=True)
+        return True
+
     def _find_manifest_path(self, start_path: str) -> str:
         """Traverses up the directory tree to find AndroidManifest.xml."""
         current_dir = os.path.dirname(os.path.abspath(start_path))
@@ -382,14 +707,537 @@ class Engine:
         global_context = self._build_global_context()
         log.info("Generating Chained Exploits with Global Context...")
         
-        for finding in self.vulnerability_findings:
-            self._generate_poc(
+        # PoC generation is the most expensive call in the pipeline (measured 32-250s
+        # each) and findings are independent of one another — the shared global context
+        # is computed once, above. Running them one at a time made total time the SUM of
+        # every finding; they now share the same bounded pool as the deep scan.
+        # executor.map preserves input order, so poc_results stays deterministic.
+        findings = list(self.vulnerability_findings)
+        if not findings:
+            return
+
+        def _poc_for(finding):
+            self._metric_add("exploit_attempts")
+            return self._generate_poc(
                 finding["file_path"],
                 finding["code_snippet"],
                 finding["vuln_description"],
                 finding["rule_name"],
                 global_context
             )
+
+        # Defensive like the metric helpers: callers that construct an Engine without
+        # settings (tests, partial pipelines) must degrade to serial, not crash.
+        settings = getattr(self, "settings", None)
+        configured = getattr(getattr(settings, "analysis", None), "max_workers", 1) or 1
+        workers = max(1, min(configured, len(findings)))
+        if workers == 1:
+            self.poc_results.extend(_poc_for(f) for f in findings)
+            return
+        log.info(f"Generating {len(findings)} PoC(s) with {workers} worker(s)...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            self.poc_results.extend(pool.map(_poc_for, findings))
+
+    @staticmethod
+    def _poc_result(file_path: str, rule_name: str, status: str,
+                    artifact_path: str = "", error: dict = None,
+                    validation: dict = None) -> dict:
+        """Build a PoC audit record without modifying its static finding.
+
+        Verification lifecycle values are `generated`, `validation-error`,
+        `execution-error`, `reproduced`, and `not-reproduced`. If generation never
+        produced an artifact, `Unanalyzed` is used instead of implying safety.
+        """
+        if status not in POC_STATUSES:
+            raise ValueError(f"Unknown PoC status: {status}")
+        result = {
+            "file": file_path,
+            "rule": rule_name,
+            "status": status,
+            # Runtime verification is intentionally never automatic. A caller may
+            # later record reproduced/not-reproduced/execution-error after an
+            # explicitly authorized emulator/device run.
+            "runtime_status": "not-run",
+        }
+        if artifact_path:
+            result["artifact_path"] = artifact_path
+        if error:
+            result["error"] = error
+        if validation is not None:
+            result["validation"] = validation
+        return result
+
+    @staticmethod
+    def _syntax_check_poc(poc_content: str, extension: str) -> dict:
+        """Parse an artifact without executing it."""
+        try:
+            if extension == ".sh":
+                completed = subprocess.run(
+                    ["bash", "-n"], input=poc_content, text=True,
+                    capture_output=True, timeout=10, check=False,
+                )
+                if completed.returncode:
+                    return {"name": "syntax", "status": "failed",
+                            "detail": (completed.stderr or "bash -n failed").strip()}
+                return {"name": "syntax", "status": "passed", "detail": "bash -n"}
+            if extension == ".py":
+                ast.parse(poc_content)
+                return {"name": "syntax", "status": "passed", "detail": "ast.parse"}
+            if extension == ".js":
+                node = shutil.which("node")
+                if not node:
+                    return {"name": "syntax", "status": "warning",
+                            "detail": "node unavailable; JavaScript syntax not verified"}
+                completed = subprocess.run(
+                    [node, "--check", "-"], input=poc_content, text=True,
+                    capture_output=True, timeout=10, check=False,
+                )
+                if completed.returncode:
+                    return {"name": "syntax", "status": "failed",
+                            "detail": (completed.stderr or "node --check failed").strip()}
+                return {"name": "syntax", "status": "passed", "detail": "node --check"}
+            if extension == ".html":
+                parser = HTMLParser()
+                parser.feed(poc_content)
+                parser.close()
+                return {"name": "syntax", "status": "passed", "detail": "HTMLParser"}
+            return {"name": "syntax", "status": "failed",
+                    "detail": f"unsupported runnable artifact type: {extension}"}
+        except (SyntaxError, subprocess.TimeoutExpired) as exc:
+            return {"name": "syntax", "status": "failed", "detail": str(exc)}
+        except Exception as exc:
+            return {"name": "syntax", "status": "warning",
+                    "detail": f"syntax validator unavailable: {exc}"}
+
+    @staticmethod
+    def _target_extra_types(code_snippet: str) -> dict:
+        """Extract literal Android extra keys and their expected API types."""
+        api_types = {
+            "String": "string", "CharSequence": "string", "Parcelable": "parcelable",
+            "Serializable": "serializable", "Int": "int", "Integer": "int",
+            "Boolean": "boolean", "Long": "long", "Float": "float", "Double": "float",
+            "Byte": "int", "Short": "int", "StringArray": "string-array",
+            "IntArray": "int-array", "IntegerArrayList": "int-array",
+            "LongArray": "long-array", "FloatArray": "float-array",
+        }
+        found = {}
+        for api_name, key in re.findall(
+            r"get([A-Za-z]+)Extra\s*\(\s*[\"']([^\"']+)[\"']", code_snippet
+        ):
+            if api_name in api_types:
+                found[key] = api_types[api_name]
+        for api_name, key in re.findall(
+            r"\.get([A-Za-z]+)\s*\(\s*[\"']([^\"']+)[\"']", code_snippet
+        ):
+            if api_name in api_types:
+                found.setdefault(key, api_types[api_name])
+        return found
+
+    @staticmethod
+    def _framework_extra_types(code_snippet: str) -> dict:
+        """Return framework-owned extras only when inheritance proves the contract.
+
+        PreferenceActivity consumes these keys inside Android framework code, so they
+        normally do not appear in the application's decompiled class. They must not be
+        globally allowlisted: the same keys remain invalid for unrelated components.
+        """
+        is_preference_activity = bool(
+            re.search(
+                r"\bextends\s+(?:android\.preference\.)?PreferenceActivity\b",
+                code_snippet,
+            )
+            or re.search(
+                r"(?m)^\s*\.super\s+Landroid/preference/PreferenceActivity;",
+                code_snippet,
+            )
+        )
+        if not is_preference_activity:
+            return {}
+        return {
+            ":android:show_fragment": "string",
+            ":android:no_headers": "boolean",
+        }
+
+    @staticmethod
+    def _preference_activity_allows_fragment(code_snippet: str) -> bool:
+        """Recognize an unconditional Java or Smali isValidFragment true verdict."""
+        java_method = re.search(
+            r"\bisValidFragment\s*\([^)]*\)\s*\{(?P<body>.*?)\}",
+            code_snippet,
+            re.DOTALL,
+        )
+        if java_method and re.search(r"\breturn\s+true\s*;", java_method.group("body")):
+            return True
+
+        smali_method = re.search(
+            r"(?ms)^\s*\.method[^\n]*\bisValidFragment\([^\n]*\)Z\s*"
+            r"(?P<body>.*?)^\s*\.end method",
+            code_snippet,
+        )
+        if smali_method:
+            body = smali_method.group("body")
+            true_registers = set(re.findall(
+                r"\bconst(?:/4|/16)?\s+([vp]\d+),\s+0x1\b", body
+            ))
+            return any(re.search(rf"\breturn\s+{re.escape(register)}\b", body)
+                       for register in true_registers)
+        return False
+
+    @staticmethod
+    def _frida_string_constants(poc_content: str) -> dict:
+        """Map simple string constants declared in a Frida script.
+
+        Well-written PoCs hoist keys into constants (``var EXTRA_KEY = "forward_intent"``)
+        instead of repeating literals. Matching only inline literals made those calls
+        invisible to validation and rejected correct artifacts.
+        """
+        return dict(re.findall(
+            r"(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*['\"]([^'\"]*)['\"]\s*;",
+            poc_content,
+        ))
+
+    @staticmethod
+    def _frida_resolve_string(raw: str, const_strings: dict) -> str:
+        """Resolve a quoted literal or a known string constant to its value."""
+        raw = raw.strip()
+        if len(raw) >= 2 and raw[0] in "'\"" and raw[-1] == raw[0]:
+            return raw[1:-1]
+        return const_strings.get(raw, raw)
+
+    @staticmethod
+    def _frida_put_extra_calls(poc_content: str) -> list:
+        """Return literal Frida ``putExtra`` calls with receiver and value flow.
+
+        Keeping the receiver is security-significant for Intent Redirection: an
+        extra placed on the outer Intent is part of the vulnerable component's
+        input contract, while an extra placed on the attacker-controlled nested
+        Intent belongs to the forwarded payload. The previous key-only regex
+        erased that distinction and rejected valid observation markers.
+        """
+        const_strings = Engine._frida_string_constants(poc_content)
+
+        def _resolve_key(raw: str) -> str:
+            return Engine._frida_resolve_string(raw, const_strings)
+
+        # A key is either a quoted literal or an identifier resolved above.
+        key_pattern = r"(?:['\"][^'\"]+['\"]|[A-Za-z_$][\w$]*)"
+        calls = []
+        overload_calls = re.compile(
+            r"(?P<method_receiver>\b[A-Za-z_$][\w$]*)\.putExtra\.overload\([^;]*?\)"
+            r"\s*\.call\(\s*(?P<receiver>[A-Za-z_$][\w$]*)\s*,\s*"
+            rf"(?P<key>{key_pattern})\s*,\s*(?P<value>.*?)\)\s*;",
+            re.DOTALL,
+        )
+        direct_calls = re.compile(
+            r"(?P<receiver>\b[A-Za-z_$][\w$]*)\.putExtra\s*\(\s*"
+            rf"(?P<key>{key_pattern})\s*,\s*(?P<value>.*?)\)\s*;",
+            re.DOTALL,
+        )
+        for pattern in (overload_calls, direct_calls):
+            for match in pattern.finditer(poc_content):
+                calls.append({
+                    "offset": match.start(),
+                    "receiver": match.group("receiver"),
+                    "key": _resolve_key(match.group("key")),
+                    "value": match.group("value").strip(),
+                })
+        return sorted(calls, key=lambda call: call["offset"])
+
+    @staticmethod
+    def _frida_intent_instances(poc_content: str) -> set:
+        """Find Frida variables proven to be constructed Android Intent objects."""
+        factories = set(re.findall(
+            r"(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+            r"Java\.use\(\s*['\"]android\.content\.Intent['\"]\s*\)",
+            poc_content,
+        ))
+        instances = set()
+        for factory in factories:
+            instances.update(re.findall(
+                rf"(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+                rf"{re.escape(factory)}\.\$new\s*\(",
+                poc_content,
+            ))
+        return instances
+
+    @classmethod
+    def _frida_nested_intent_receivers(cls, poc_content: str, target_types: dict,
+                                       put_extra_calls: list) -> set:
+        """Find Intent instances passed as a target's literal Parcelable extra."""
+        intent_instances = cls._frida_intent_instances(poc_content)
+        nested = set()
+        for call in put_extra_calls:
+            if target_types.get(call["key"]) != "parcelable":
+                continue
+            for instance in intent_instances:
+                if re.search(rf"\b{re.escape(instance)}\b", call["value"]):
+                    nested.add(instance)
+        return nested
+
+    @classmethod
+    def _validate_poc_artifact(cls, poc_content: str, extension: str,
+                               rule_name: str, file_path: str,
+                               code_snippet: str, manifest_context: str,
+                               global_context: str = "") -> dict:
+        """Conservatively validate a generated artifact without running it.
+
+        A check fails only for a proven contradiction (syntax error, invented literal
+        target-contract IPC identifier, known extra type mismatch, or crash claimed as Intent
+        Redirection success). Ambiguous/dynamic values remain warnings so validation
+        cannot become a discovery gate.
+        """
+        checks = [cls._syntax_check_poc(poc_content, extension)]
+        evidence = "\n".join((file_path, code_snippet, manifest_context, global_context))
+
+        # Parse IPC flags only from actual `am` commands. Looking for `-a`/`-n`
+        # across an entire shell script would misread ordinary grep/test/curl flags.
+        normalized_poc = re.sub(r"\\\s*\n\s*", " ", poc_content)
+        ipc_commands = "\n".join(
+            line for line in normalized_poc.splitlines()
+            if re.search(r"\bam\s+(?:start|broadcast|startservice|start-foreground-service)\b", line)
+        )
+
+        # Literal components/actions can be checked against the exact analyzed
+        # source/manifest. Shell variables and computed values remain warnings.
+        components = re.findall(r"(?:^|\s)-n\s+['\"]?([^\s'\"]+)", ipc_commands)
+        for component in components:
+            if "$" in component or "${" in component:
+                checks.append({"name": "component_provenance", "status": "warning",
+                               "detail": f"dynamic component not statically verified: {component}"})
+                continue
+            class_part = component.rsplit("/", 1)[-1].lstrip(".")
+            if class_part and class_part in evidence:
+                checks.append({"name": "component_provenance", "status": "passed",
+                               "detail": component})
+            else:
+                checks.append({"name": "component_provenance", "status": "failed",
+                               "detail": f"component not found in analyzed code/manifest: {component}"})
+
+        frida_components = re.findall(
+            r"\.setClassName\s*\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]",
+            poc_content,
+        )
+        frida_components += re.findall(
+            r"ComponentName\.\$new\s*\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]",
+            poc_content,
+        )
+        for package_name, class_name in frida_components:
+            component = f"{package_name}/{class_name}"
+            simple_name = class_name.rsplit(".", 1)[-1]
+            if simple_name in evidence and package_name in evidence:
+                checks.append({"name": "component_provenance", "status": "passed",
+                               "detail": component})
+            else:
+                checks.append({"name": "component_provenance", "status": "failed",
+                               "detail": f"component not found in analyzed context: {component}"})
+
+        actions = re.findall(r"(?:^|\s)-a\s+['\"]?([^\s'\"]+)", ipc_commands)
+        for action in actions:
+            if "$" in action:
+                checks.append({"name": "action_provenance", "status": "warning",
+                               "detail": f"dynamic action not statically verified: {action}"})
+            elif action in evidence:
+                checks.append({"name": "action_provenance", "status": "passed", "detail": action})
+            else:
+                checks.append({"name": "action_provenance", "status": "failed",
+                               "detail": f"action not found in analyzed code/manifest: {action}"})
+
+        flag_types = {
+            "--es": "string", "--esn": "string", "--ei": "int", "--ez": "boolean",
+            "--el": "long", "--ef": "float", "--eu": "uri", "--ecn": "component",
+            "--esa": "string-array", "--eia": "int-array", "--ela": "long-array",
+            "--efa": "float-array",
+        }
+        target_types = cls._target_extra_types(code_snippet)
+        framework_extra_types = cls._framework_extra_types(code_snippet)
+        for key, expected_type in framework_extra_types.items():
+            target_types.setdefault(key, expected_type)
+        extras = re.findall(
+            r"(?:^|\s)(--esn|--es|--ei|--ez|--el|--ef|--eu|--ecn|--esa|--eia|--ela|--efa)"
+            r"\s+['\"]?([^\s'\"]+)", ipc_commands
+        )
+        for flag, key in extras:
+            if "$" in key:
+                checks.append({"name": "extra_provenance", "status": "warning",
+                               "detail": f"dynamic extra key not statically verified: {key}"})
+                continue
+            expected = target_types.get(key)
+            if expected is None:
+                if key in evidence:
+                    checks.append({"name": "extra_provenance", "status": "warning",
+                                   "detail": f"extra key found but target type unresolved: {key}"})
+                else:
+                    checks.append({"name": "extra_provenance", "status": "failed",
+                                   "detail": f"extra key not found in analyzed code/manifest: {key}"})
+                continue
+            if key in framework_extra_types:
+                checks.append({
+                    "name": "extra_provenance",
+                    "status": "passed",
+                    "detail": f"{key}: PreferenceActivity framework contract",
+                })
+            actual = flag_types[flag]
+            type_matches = actual == expected or (
+                expected == "parcelable" and actual in {"uri", "component"}
+            )
+            checks.append({
+                "name": "extra_type",
+                "status": "passed" if type_matches else "failed",
+                "detail": (f"{key}: {actual}" if type_matches else
+                           f"{key}: PoC sends {actual}, target reads {expected}"),
+            })
+
+        frida_extra_calls = cls._frida_put_extra_calls(poc_content)
+        frida_extra_keys = [call["key"] for call in frida_extra_calls]
+        nested_intent_receivers = cls._frida_nested_intent_receivers(
+            poc_content, target_types, frida_extra_calls
+        )
+
+        # An action set on the NESTED Intent is the attacker-chosen payload — the whole
+        # point of Intent Redirection is that the victim forwards an Intent it never
+        # declared. Requiring it to appear in the manifest inverts the threat model and
+        # rejects correct PoCs (observed failing a valid nested VIEW payload). Only the
+        # outer, entry-point action has to be provable from the analyzed context.
+        for _match in re.finditer(
+            r"\b([A-Za-z_$][\w$]*)\.setAction\s*\(\s*['\"]([^'\"]+)['\"]", poc_content
+        ):
+            _receiver, action = _match.group(1), _match.group(2)
+            if _receiver in nested_intent_receivers:
+                checks.append({
+                    "name": "action_provenance",
+                    "status": "warning",
+                    "detail": f"attacker-controlled nested payload action: {action}",
+                })
+            else:
+                checks.append({
+                    "name": "action_provenance",
+                    "status": "passed" if action in evidence else "failed",
+                    "detail": (action if action in evidence else
+                               f"action not found in analyzed context: {action}"),
+                })
+        # An observation marker is one the script writes AND reads back to prove the
+        # redirect happened. Keys are routinely hoisted into constants and probed with
+        # hasExtra() as well as get*Extra(), so resolve constants and accept both —
+        # otherwise a correct marker reads as an unknown extra and fails validation.
+        _poc_constants = Engine._frida_string_constants(poc_content)
+        frida_observation_keys = {
+            Engine._frida_resolve_string(raw, _poc_constants)
+            for raw in re.findall(
+                r"\.(?:get[A-Za-z]*Extra|hasExtra)\s*\(\s*"
+                r"(['\"][^'\"]+['\"]|[A-Za-z_$][\w$]*)",
+                poc_content,
+            )
+        }
+        for call in frida_extra_calls:
+            key = call["key"]
+            if key in framework_extra_types:
+                checks.append({
+                    "name": "extra_provenance", "status": "passed",
+                    "detail": f"{key}: PreferenceActivity framework contract",
+                })
+            elif key in target_types or key in evidence:
+                checks.append({"name": "extra_provenance", "status": "passed", "detail": key})
+            elif (
+                rule_name == "intent_redirection"
+                and call["receiver"] in nested_intent_receivers
+                and key in frida_observation_keys
+            ):
+                checks.append({
+                    "name": "extra_provenance", "status": "warning",
+                    "detail": (
+                        f"nested Intent observation marker is local to the Frida "
+                        f"verification flow: {key}"
+                    ),
+                })
+            else:
+                checks.append({"name": "extra_provenance", "status": "failed",
+                               "detail": f"extra key not found in analyzed context: {key}"})
+
+        supplied_extra_keys = {key for _, key in extras} | set(frida_extra_keys)
+        if ":android:show_fragment" in supplied_extra_keys and framework_extra_types:
+            if cls._preference_activity_allows_fragment(code_snippet):
+                checks.append({
+                    "name": "fragment_policy", "status": "passed",
+                    "detail": "isValidFragment unconditionally returns true",
+                })
+            else:
+                checks.append({
+                    "name": "fragment_policy", "status": "warning",
+                    "detail": "PreferenceActivity contract is present but the requested fragment allow decision is not statically proven",
+                })
+
+            exported_match = re.search(
+                r"(?im)^\s*Exported:\s*(true|false|none)\s*$", manifest_context
+            )
+            if exported_match and exported_match.group(1).lower() == "true":
+                checks.append({
+                    "name": "component_reachability", "status": "passed",
+                    "detail": "manifest marks PreferenceActivity component exported",
+                })
+            elif exported_match and exported_match.group(1).lower() == "false":
+                checks.append({
+                    "name": "component_reachability", "status": "failed",
+                    "detail": "manifest marks PreferenceActivity component non-exported",
+                })
+            else:
+                checks.append({
+                    "name": "component_reachability", "status": "warning",
+                    "detail": "exported reachability is not proven by manifest context",
+                })
+
+        if rule_name == "intent_redirection":
+            parcelable_keys = {
+                key for key, expected_type in target_types.items()
+                if expected_type == "parcelable"
+            }
+            for key in parcelable_keys:
+                if key not in frida_extra_keys and not any(extra_key == key for _, extra_key in extras):
+                    checks.append({"name": "intent_payload", "status": "failed",
+                                   "detail": f"nested Parcelable extra is never sent: {key}"})
+                elif key in frida_extra_keys:
+                    checks.append({"name": "intent_payload", "status": "passed",
+                                   "detail": f"nested extra constructed with putExtra: {key}"})
+            if "startActivity" not in poc_content:
+                checks.append({"name": "intent_trigger", "status": "failed",
+                               "detail": "artifact never invokes startActivity"})
+            else:
+                checks.append({"name": "intent_trigger", "status": "passed",
+                               "detail": "startActivity invocation present"})
+
+        pass_lines = [line for line in poc_content.splitlines()
+                      if re.search(r"\b(pass|success|vulnerable)\b", line, re.IGNORECASE)]
+        # A crash is not proof of Intent Redirection, so a script claiming it is must be
+        # rejected. But a correct script says the OPPOSITE — "success = activity launched,
+        # NOT a ClassCastException" — and a bare keyword search cannot tell the two apart,
+        # failing well-formed PoCs for stating the right criterion. Only count a crash
+        # mention that is not negated.
+        _CRASH_TOKENS = r"classcastexception|securityexception|fatal exception|type[- ]confusion crash|caused .*crash"
+        _NEGATORS = r"\b(not|no|never|without|rather than|instead of|avoid(?:s|ed)?|absent|n't)\b|!=|≠"
+
+        def _claims_crash_as_proof(line: str) -> bool:
+            for match in re.finditer(_CRASH_TOKENS, line, re.IGNORECASE):
+                preceding = line[max(0, match.start() - 60):match.start()]
+                if not re.search(_NEGATORS, preceding, re.IGNORECASE):
+                    return True
+            return False
+
+        crash_claim = any(_claims_crash_as_proof(line) for line in pass_lines)
+        if rule_name == "intent_redirection" and crash_claim:
+            checks.append({"name": "success_indicator", "status": "failed",
+                           "detail": "crash is not proof of Intent Redirection"})
+        elif pass_lines:
+            checks.append({"name": "success_indicator", "status": "warning",
+                           "detail": "runtime success condition requires authorized manual verification"})
+        else:
+            checks.append({"name": "success_indicator", "status": "warning",
+                           "detail": "no explicit success indicator found"})
+
+        failed = [check for check in checks if check["status"] == "failed"]
+        return {
+            "status": "invalid" if failed else "valid",
+            "checks": checks,
+            "execution": "not-run",
+        }
 
     def _is_relevant_file(self, file_path: str, package_name: str) -> bool:
         """
@@ -474,7 +1322,7 @@ class Engine:
         return ".txt"
 
     def _generate_poc(self, file_path: str, code_snippet: str, vuln_description: str, rule_name: str, global_context: str = ""):
-        """Generates a PoC script for a confirmed vulnerability."""
+        """Generate a PoC artifact and return status independent of the finding."""
         try:
             # [NEW] Manifest Context Injection
             manifest_context = "Manifest not found or Context Injection disabled."
@@ -506,15 +1354,29 @@ class Engine:
             except Exception as e:
                 log.warning(f"Secret extraction failed: {e}")
 
-            # [LOGIC GUARD] Skip exploit generation if "Hardcoded Secrets" is the issue but Regex found nothing.
-            if rule_name == "Hardcoded Secrets" and detected_secrets_str == "None detected.":
-                log.warning(f"Skipping exploit generation for {os.path.basename(file_path)}: Vulnerability is 'Hardcoded Secrets' but no actual secrets extracted by Regex.")
-                return "" # Return empty string to signal skip
+            # Rule findings carry YAML keys, not display names. Missing evidence only
+            # makes the PoC unanalyzed; the confirmed static finding remains intact.
+            if rule_name in {"hardcoded_secrets", "hardcoded_secrets_xml"} and detected_secrets_str == "None detected.":
+                log.warning(
+                    f"Skipping PoC generation for {os.path.basename(file_path)}: "
+                    f"rule '{rule_name}' has no secret value extracted for a concrete payload."
+                )
+                self._record_pipeline_error(
+                    file_path,
+                    "exploit_generation",
+                    "missing_secret_evidence",
+                )
+                self._metric_add("exploit_errors")
+                return self._poc_result(
+                    file_path, rule_name, "Unanalyzed",
+                    error={"stage": "generation", "reason": "missing_secret_evidence"},
+                )
 
             with open("config/prompts/exploit_prompt.txt", "r") as f:
                 prompt_template = f.read()
             
             prompt = prompt_template.replace("{vulnerability_description}", vuln_description)
+            prompt = prompt.replace("{rule_name}", rule_name)
             prompt = prompt.replace("{file_path}", file_path)
             prompt = prompt.replace("{manifest_context}", manifest_context) # Inject Manifest
             prompt = prompt.replace("{detected_secrets}", detected_secrets_str) # Inject Secrets
@@ -553,7 +1415,12 @@ class Engine:
             
             if not poc_content:
                 log.warning("PoC generation returned empty.")
-                return
+                self._record_pipeline_error(file_path, "exploit_generation", "empty")
+                self._metric_add("exploit_errors")
+                return self._poc_result(
+                    file_path, rule_name, "Unanalyzed",
+                    error={"stage": "generation", "reason": "empty"},
+                )
 
             # [FIX] Strip markdown code fences that LLMs often wrap output with.
             # e.g. ```bash\n...\n``` or ```python\n...\n```
@@ -596,11 +1463,52 @@ class Engine:
                 current_mode = os.stat(save_path).st_mode
                 os.chmod(save_path, current_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
                 log.debug(f"chmod +x applied to {filename}")
-                
-            log.success(f"PoC saved to {save_path}")
+
+            validation = self._validate_poc_artifact(
+                poc_content, ext, rule_name, file_path, code_snippet,
+                manifest_context, global_context
+            )
+            self._metric_add("exploit_generated")
+            if validation["status"] == "invalid":
+                failed_details = "; ".join(
+                    check["detail"] for check in validation["checks"]
+                    if check["status"] == "failed"
+                )
+                log.warning(
+                    f"PoC saved for manual review but failed static validation: {save_path}"
+                )
+                # The artifact is kept on disk for manual review, but it must not be
+                # cached: replaying an unusable PoC would make the failure permanent
+                # (seen with a reply that was just the word "not", saved as .txt).
+                self._invalidate_structured_response(
+                    "", context_wrapper_safe, client=self.exploit_llm_client
+                )
+                self._record_pipeline_error(
+                    file_path, "exploit_validation", "invalid_artifact", failed_details
+                )
+                self._metric_add("exploit_validation_errors")
+                return self._poc_result(
+                    file_path, rule_name, "validation-error", save_path,
+                    error={"stage": "validation", "reason": "invalid_artifact",
+                           "detail": failed_details},
+                    validation=validation,
+                )
+
+            log.success(f"PoC generated and statically validated: {save_path}")
+            self._metric_add("exploit_successes")
+            return self._poc_result(
+                file_path, rule_name, "generated", save_path, validation=validation
+            )
 
         except Exception as e:
             log.error(f"Failed to generate PoC: {e}")
+            reason = "timeout" if isinstance(e, TimeoutError) else "exception"
+            self._record_pipeline_error(file_path, "exploit_generation", reason, str(e))
+            self._metric_add("exploit_errors")
+            return self._poc_result(
+                file_path, rule_name, "Unanalyzed",
+                error={"stage": "generation", "reason": reason, "detail": str(e)},
+            )
 
     def _extract_json_str(self, text: str) -> str:
         """
@@ -675,18 +1583,45 @@ class Engine:
             if not candidate: continue
             try:
                 # strict=False allows control characters like newlines in strings
-                return json.loads(candidate, strict=False)
+                parsed = json.loads(candidate, strict=False)
+                if isinstance(parsed, dict):
+                    return parsed
             except json.JSONDecodeError:
                 # Sub-strategy: Fix common JSON issues (trailing commas)
                 try:
                     fixed_json = re.sub(r',\s*([\]\}])', r'\1', candidate)
-                    return json.loads(fixed_json, strict=False)
+                    parsed = json.loads(fixed_json, strict=False)
+                    if isinstance(parsed, dict):
+                        return parsed
                 except:
+                    pass
+
+                # Sub-strategy: drop backslashes that don't open a valid JSON escape.
+                # Models routinely emit \' when quoting code inside "evidence" — legal in
+                # Java/Python, illegal in JSON (only \" \\ \/ \b \f \n \r \t \uXXXX are).
+                # Since this engine deliberately asks for code in that field, the mistake
+                # recurs; one such response was observed poisoning the cache and turning an
+                # intermittent failure into a permanent one. Runs only after the strict
+                # parses above fail, so well-formed output is never touched.
+                try:
+                    repaired = re.sub(
+                        r'\\(.)',
+                        lambda m: m.group(0) if m.group(1) in '"\\/bfnrtu' else m.group(1),
+                        candidate,
+                    )
+                    if repaired != candidate:
+                        parsed = json.loads(repaired, strict=False)
+                        if isinstance(parsed, dict):
+                            log.debug("Parsed LLM response after repairing invalid JSON escapes.")
+                            return parsed
+                except Exception:
                     pass
                 
                 # Sub-strategy: Python AST Fallback (Single quotes, etc.)
                 try:
-                    return ast.literal_eval(candidate)
+                    parsed = ast.literal_eval(candidate)
+                    if isinstance(parsed, dict):
+                        return parsed
                 except:
                     pass
 
@@ -789,8 +1724,13 @@ class Engine:
                     external_context += "The following are summaries of classes called by this file. Use this to verify inputs/outputs and reduce false positives.\n"
                     external_context += "\n".join(relevant_summaries)
         
+        # Keep the complete context for static detection gates. Truncation is only a
+        # transport limit for the LLM prompt; using the truncated text for detection
+        # could silently drop a source/sink pattern located in the omitted middle.
+        rule_gate_context = code_snippet + external_context
+
         # Combine snippets for the prompt
-        full_code_context = code_snippet + external_context
+        full_code_context = rule_gate_context
         # [#5] Cap oversized content before it reaches the LLM.
         full_code_context = self._truncate_for_llm(full_code_context)
 
@@ -829,7 +1769,7 @@ class Engine:
                      pattern = prompt_data.get("detection_pattern")
                      if pattern:
                          import re
-                         if not re.search(pattern, full_code_context, re.IGNORECASE | re.DOTALL):
+                         if not re.search(pattern, rule_gate_context, re.IGNORECASE | re.DOTALL):
                              log.debug(f"Skipping library file {os.path.basename(file_path)}: No suspicious pattern found.")
                              return results
 
@@ -845,10 +1785,12 @@ class Engine:
 
                  # Run Analysis
                  try:
+                     self._metric_add("deep_rule_checks")
                      raw_result = self.llm_client.analyze_code(llm_input, context)
 
                      # [FIX #2] A failed LLM call must not read as a clean library.
                      if self._is_failed_response(raw_result):
+                         self._record_deep_rule_outcome("Error")
                          log.warning(f"LLM library scan failed for {os.path.basename(file_path)}; marking as Error (not clean).")
                          results.append(self._build_error_result(file_path, "library_vulnerability", "Library Hunter"))
                          return results
@@ -857,11 +1799,34 @@ class Engine:
 
                      # [B] Non-empty but unparseable (e.g. prose from a local model) -> Error, not clean.
                      if parsed_result.get("_parse_failed"):
+                         self._record_deep_rule_outcome("Error")
                          log.warning(f"Unparseable LLM output for library scan of {os.path.basename(file_path)}; marking as Error.")
-                         results.append(self._build_error_result(file_path, "library_vulnerability", "Library Hunter", reason="unparseable"))
+                         self._invalidate_structured_response(llm_input, context)
+                         results.append(self._build_error_result(
+                             file_path,
+                             "library_vulnerability",
+                             "Library Hunter",
+                             reason="unparseable",
+                             raw_response=raw_result,
+                         ))
                          return results
 
                      status = self.get_status(parsed_result)
+
+                     if status == "Error":
+                         self._record_deep_rule_outcome("Error")
+                         log.warning(
+                             f"Invalid LLM verdict for library scan of {os.path.basename(file_path)}; "
+                             "marking as Error (not clean)."
+                         )
+                         results.append(self._build_error_result(
+                             file_path,
+                             "library_vulnerability",
+                             "Library Hunter",
+                             reason="invalid_verdict",
+                             raw_response=raw_result,
+                         ))
+                         return results
 
                      if status == "Vulnerable":
                          parsed_result = self._enrich_result("library_vulnerability", parsed_result)
@@ -880,8 +1845,18 @@ class Engine:
                             "status": status,
                             "result": parsed_result
                          })
+                     self._record_deep_rule_outcome(status)
                  except Exception as e:
+                     self._record_deep_rule_outcome("Error")
                      log.error(f"Library Scan failed for {file_path}: {e}")
+                     reason = "timeout" if isinstance(e, TimeoutError) else "exception"
+                     results.append(self._build_error_result(
+                         file_path,
+                         "library_vulnerability",
+                         "Library Hunter",
+                         reason=reason,
+                         detail=str(e),
+                     ))
              
              # [CRITICAL OPTIMIZATION] Early Return!
              # We assume standard logic rules (like 'Intent Spoofing' in App Logic) are less relevant 
@@ -890,14 +1865,25 @@ class Engine:
 
         for rule_name, enabled in self.settings.rules.model_dump().items():
             if enabled and rule_name not in DEDICATED_PASS_RULES:
-                if rules_to_run and rule_name not in rules_to_run:
+                if rules_to_run is not None and rule_name not in rules_to_run:
                     continue
                 prompt_path = f"config/prompts/vuln_rules/{rule_name}.yaml"
-                with open(prompt_path, "r") as f:
-                    prompt_data = yaml.safe_load(f)
+                try:
+                    with open(prompt_path, "r") as f:
+                        prompt_data = yaml.safe_load(f)
+                except Exception as exc:
+                    log.error(f"Could not load rule '{rule_name}': {exc}")
+                    results.append(self._build_error_result(
+                        file_path,
+                        rule_name,
+                        rule_name,
+                        reason="exception",
+                        detail=f"rule config: {exc}",
+                    ))
+                    continue
 
                 # [FIX #1] Skip this rule's LLM call if its detection pattern doesn't match.
-                if not self._rule_should_run(rule_name, prompt_data, full_code_context):
+                if not self._rule_should_run(rule_name, prompt_data, rule_gate_context):
                     log.debug(f"Gated: rule '{rule_name}' skipped for {os.path.basename(file_path)} (no pattern match).")
                     continue
 
@@ -929,10 +1915,28 @@ class Engine:
                 }
 
                 # Pass the ENRICHED context (code + cross-ref + manifest reachability)
-                raw_result = self.llm_client.analyze_code(llm_input, context)
+                try:
+                    self._metric_add("deep_rule_checks")
+                    raw_result = self.llm_client.analyze_code(llm_input, context)
+                except Exception as exc:
+                    self._record_deep_rule_outcome("Error")
+                    reason = "timeout" if isinstance(exc, TimeoutError) else "exception"
+                    log.error(
+                        f"LLM analysis raised {reason} for rule '{rule_name}' on "
+                        f"{os.path.basename(file_path)}: {exc}"
+                    )
+                    results.append(self._build_error_result(
+                        file_path,
+                        rule_name,
+                        prompt_data["name"],
+                        reason=reason,
+                        detail=str(exc),
+                    ))
+                    continue
 
                 # [FIX #2] Distinguish a failed LLM call from a genuine "clean" verdict.
                 if self._is_failed_response(raw_result):
+                    self._record_deep_rule_outcome("Error")
                     log.warning(f"LLM analysis failed for rule '{rule_name}' on {os.path.basename(file_path)}; marking as Error (not clean).")
                     results.append(self._build_error_result(file_path, rule_name, prompt_data["name"]))
                     continue
@@ -941,11 +1945,36 @@ class Engine:
 
                 # [B] Non-empty but unparseable (e.g. prose from a local model) -> Error, not clean.
                 if parsed_result.get("_parse_failed"):
+                    self._record_deep_rule_outcome("Error")
                     log.warning(f"Unparseable LLM output for rule '{rule_name}' on {os.path.basename(file_path)}; marking as Error.")
-                    results.append(self._build_error_result(file_path, rule_name, prompt_data["name"], reason="unparseable"))
+                    self._invalidate_structured_response(llm_input, context)
+                    results.append(self._build_error_result(
+                        file_path,
+                        rule_name,
+                        prompt_data["name"],
+                        reason="unparseable",
+                        raw_response=raw_result,
+                    ))
                     continue
 
                 status = self.get_status(parsed_result)
+
+                if status == "Error":
+                    self._record_deep_rule_outcome("Error")
+                    log.warning(
+                        f"Invalid LLM verdict for rule '{rule_name}' on {os.path.basename(file_path)}; "
+                        "marking as Error (not clean)."
+                    )
+                    results.append(self._build_error_result(
+                        file_path,
+                        rule_name,
+                        prompt_data["name"],
+                        reason="invalid_verdict",
+                        raw_response=raw_result,
+                    ))
+                    continue
+
+                self._record_deep_rule_outcome(status)
 
                 # Enrich with MASVS
                 if status == "Vulnerable":
@@ -976,11 +2005,22 @@ class Engine:
 
         for rule_name in MANIFEST_RULES:
             if getattr(self.settings.rules, rule_name):
-                if rules_to_run and rule_name not in rules_to_run:
+                if rules_to_run is not None and rule_name not in rules_to_run:
                     continue
                 prompt_path = f"config/prompts/vuln_rules/{rule_name}.yaml"
-                with open(prompt_path, "r") as f:
-                    prompt_data = yaml.safe_load(f)
+                try:
+                    with open(prompt_path, "r") as f:
+                        prompt_data = yaml.safe_load(f)
+                except Exception as exc:
+                    log.error(f"Could not load manifest rule '{rule_name}': {exc}")
+                    results.append(self._build_error_result(
+                        manifest_path,
+                        rule_name,
+                        rule_name,
+                        reason="exception",
+                        detail=f"rule config: {exc}",
+                    ))
+                    continue
 
                 context = {
                     "system_prompt": self._load_system_prompt(),
@@ -989,7 +2029,20 @@ class Engine:
                     "expect_json": True  # [A] Rule analysis requires JSON output
                 }
 
-                raw_result = self.llm_client.analyze_code(code_snippet, context)
+                try:
+                    self._metric_add("manifest_rule_checks")
+                    raw_result = self.llm_client.analyze_code(code_snippet, context)
+                except Exception as exc:
+                    reason = "timeout" if isinstance(exc, TimeoutError) else "exception"
+                    log.error(f"Manifest rule '{rule_name}' raised {reason}: {exc}")
+                    results.append(self._build_error_result(
+                        manifest_path,
+                        rule_name,
+                        prompt_data["name"],
+                        reason=reason,
+                        detail=str(exc),
+                    ))
+                    continue
 
                 # [FIX #2] Failed manifest analysis is not a clean verdict.
                 if self._is_failed_response(raw_result):
@@ -1002,10 +2055,31 @@ class Engine:
                 # [B] Non-empty but unparseable output -> Error, not clean.
                 if parsed_result.get("_parse_failed"):
                     log.warning(f"Unparseable LLM output for manifest rule '{rule_name}'; marking as Error.")
-                    results.append(self._build_error_result(manifest_path, rule_name, prompt_data["name"], reason="unparseable"))
+                    self._invalidate_structured_response(code_snippet, context)
+                    results.append(self._build_error_result(
+                        manifest_path,
+                        rule_name,
+                        prompt_data["name"],
+                        reason="unparseable",
+                        raw_response=raw_result,
+                    ))
                     continue
 
                 status = self.get_status(parsed_result)
+
+                if status == "Error":
+                    log.warning(
+                        f"Invalid LLM verdict for manifest rule '{rule_name}'; "
+                        "marking as Error (not clean)."
+                    )
+                    results.append(self._build_error_result(
+                        manifest_path,
+                        rule_name,
+                        prompt_data["name"],
+                        reason="invalid_verdict",
+                        raw_response=raw_result,
+                    ))
+                    continue
 
                 # Enrich with MASVS
                 if status == "Vulnerable":
@@ -1036,7 +2110,7 @@ class Engine:
         if not getattr(self.settings.rules, rule_name):
             return []
 
-        if rules_to_run and rule_name not in rules_to_run:
+        if rules_to_run is not None and rule_name not in rules_to_run:
             return []
 
         # Find strings.xml
@@ -1072,7 +2146,19 @@ class Engine:
             "expect_json": True  # [A] Rule analysis requires JSON output
         }
 
-        raw_result = self.llm_client.analyze_code(code_snippet, context)
+        try:
+            self._metric_add("strings_rule_checks")
+            raw_result = self.llm_client.analyze_code(code_snippet, context)
+        except Exception as exc:
+            reason = "timeout" if isinstance(exc, TimeoutError) else "exception"
+            log.error(f"Strings rule '{rule_name}' raised {reason}: {exc}")
+            return [self._build_error_result(
+                strings_path,
+                rule_name,
+                prompt_data["name"],
+                reason=reason,
+                detail=str(exc),
+            )]
 
         # [FIX #2] Failed strings.xml analysis is not a clean verdict.
         if self._is_failed_response(raw_result):
@@ -1084,9 +2170,29 @@ class Engine:
         # [B] Non-empty but unparseable output -> Error, not clean.
         if parsed_result.get("_parse_failed"):
             log.warning(f"Unparseable LLM output for '{rule_name}' on strings.xml; marking as Error.")
-            return [self._build_error_result(strings_path, rule_name, prompt_data["name"], reason="unparseable")]
+            self._invalidate_structured_response(code_snippet, context)
+            return [self._build_error_result(
+                strings_path,
+                rule_name,
+                prompt_data["name"],
+                reason="unparseable",
+                raw_response=raw_result,
+            )]
 
         status = self.get_status(parsed_result)
+
+        if status == "Error":
+            log.warning(
+                f"Invalid LLM verdict for '{rule_name}' on strings.xml; "
+                "marking as Error (not clean)."
+            )
+            return [self._build_error_result(
+                strings_path,
+                rule_name,
+                prompt_data["name"],
+                reason="invalid_verdict",
+                raw_response=raw_result,
+            )]
 
         if status == "Vulnerable":
             # [V1.1.3] DEFERRED GENERATION
@@ -1107,7 +2213,308 @@ class Engine:
         })
         return results
 
-    def summarize_chunks(self, decompiled_dir: str, file_list: list = None):
+    def _summary_chunks_for_file(self, file_path: str) -> dict:
+        """Read one file and return the established ordered summary units."""
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as exc:
+            return {
+                "chunks": [],
+                "errors": [{"reason": "file_read_error", "detail": str(exc)}],
+            }
+
+        # Preserve the established chunk contract exactly: Java is one unit while a
+        # multi-class Smali file keeps every class in original order.
+        if file_path.endswith(".smali"):
+            chunks = [".class " + c for c in content.split(".class ") if c.strip()]
+        else:
+            chunks = [content] if content.strip() else []
+        return {"chunks": chunks, "errors": []}
+
+    def _summarize_unit(self, file_path: str, chunk: str, summarize_prompt: str) -> dict:
+        """Run one established summary call; also used as mandatory batch fallback."""
+        context = {
+            "system_prompt": "",
+            "vuln_prompt": summarize_prompt,
+            "file_path": file_path,
+        }
+        try:
+            summary = self.llm_client.analyze_code(self._truncate_for_llm(chunk), context)
+        except Exception as exc:
+            reason = "timeout" if isinstance(exc, TimeoutError) else "exception"
+            return {
+                "summary": "",
+                "errors": [{"reason": reason, "detail": str(exc)}],
+                "calls": 1,
+            }
+        log.debug(f"Summary for {file_path}: {summary}")
+        if summary and summary.strip():
+            return {"summary": summary.strip(), "errors": [], "calls": 1}
+        return {
+            "summary": "",
+            "errors": [{"reason": "empty", "detail": ""}],
+            "calls": 1,
+        }
+
+    def _summarize_file(self, file_path: str, summarize_prompt: str) -> dict:
+        """Summarize one file without mutating shared scan/report state."""
+        prepared = self._summary_chunks_for_file(file_path)
+        errors = list(prepared["errors"])
+        call_count = 0
+        file_summaries = []
+        for chunk in prepared["chunks"]:
+            outcome = self._summarize_unit(file_path, chunk, summarize_prompt)
+            call_count += outcome["calls"]
+            errors.extend(outcome["errors"])
+            if outcome["summary"]:
+                file_summaries.append(outcome["summary"])
+        return {
+            "summary": "\n".join(file_summaries),
+            "errors": errors,
+            "calls": call_count,
+        }
+
+    @staticmethod
+    def _summary_unit_id(file_index: int, file_path: str, chunk_index: int) -> str:
+        """Return a stable opaque id that cannot collide on basename alone."""
+        import hashlib
+        identity = f"{file_index}\0{file_path}\0{chunk_index}".encode(
+            "utf-8", errors="replace"
+        )
+        return "summary_" + hashlib.sha256(identity).hexdigest()
+
+    def _invalidate_structured_response(self, payload: str, context: dict, client=None):
+        """Best-effort removal of a cached response that higher-level validation rejected.
+
+        The cache can only tell whether a response was non-empty; it cannot know whether
+        the engine could actually USE it. Without this, one unparseable (but non-empty)
+        reply is cached forever and replayed on every later run, turning a transient
+        provider glitch into a permanent one — observed twice in practice: a reply using
+        the invalid \' JSON escape, and a PoC reply that was literally the word "not".
+        """
+        invalidator = getattr(client or self.llm_client, "invalidate", None)
+        if not callable(invalidator):
+            return
+        try:
+            invalidator(payload, context)
+        except Exception as exc:
+            log.debug(f"Could not invalidate invalid summary batch response: {exc}")
+
+    def _fallback_summary_batch(self, units: list, summarize_prompt: str, detail: str) -> dict:
+        """Retry every supplied unit with the established individual contract."""
+        unit_results = {}
+        calls = 0
+        for unit in units:
+            result = self._summarize_unit(
+                unit["file_path"], unit["chunk"], summarize_prompt
+            )
+            unit_results[unit["id"]] = result
+            calls += result["calls"]
+        return {
+            "unit_results": unit_results,
+            "calls": calls,
+            "valid_items": 0,
+            "fallback_items": len(units),
+            "batch_failed": True,
+            "batch_failure_detail": detail,
+        }
+
+    def _summarize_batch(self, units: list, summarize_prompt: str) -> dict:
+        """Summarize strict id->summary JSON and retry missing items individually."""
+        import json
+
+        payload = json.dumps(
+            {
+                "items": [
+                    {"id": unit["id"], "code": self._truncate_for_llm(unit["chunk"])}
+                    for unit in units
+                ]
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        context = {
+            "system_prompt": "",
+            "vuln_prompt": summarize_prompt + SUMMARY_BATCH_SUFFIX,
+            "file_path": "summary_batch:" + units[0]["id"],
+        }
+        try:
+            raw_result = self.llm_client.analyze_code(payload, context)
+        except Exception as exc:
+            reason = "timeout" if isinstance(exc, TimeoutError) else "exception"
+            fallback = self._fallback_summary_batch(
+                units, summarize_prompt, f"{reason}: {exc}"
+            )
+            fallback["calls"] += 1
+            return fallback
+
+        if self._is_failed_response(raw_result):
+            fallback = self._fallback_summary_batch(units, summarize_prompt, "empty")
+            fallback["calls"] += 1
+            return fallback
+
+        parsed = self._parse_llm_response(raw_result)
+        expected_ids = {unit["id"] for unit in units}
+        structural_failure = (
+            parsed.get("_parse_failed") is True
+            or any(key not in expected_ids for key in parsed)
+        )
+        if structural_failure:
+            self._invalidate_structured_response(payload, context)
+            fallback = self._fallback_summary_batch(
+                units, summarize_prompt, "invalid batch JSON mapping"
+            )
+            fallback["calls"] += 1
+            return fallback
+
+        unit_results = {}
+        fallback_units = []
+        valid_items = 0
+        for unit in units:
+            summary = parsed.get(unit["id"])
+            if isinstance(summary, str) and summary.strip():
+                unit_results[unit["id"]] = {
+                    "summary": summary.strip(),
+                    "errors": [],
+                    "calls": 0,
+                }
+                valid_items += 1
+            else:
+                fallback_units.append(unit)
+
+        calls = 1
+        if fallback_units:
+            # Partial output is usable for this run but is not a persistent success.
+            self._invalidate_structured_response(payload, context)
+            fallback = self._fallback_summary_batch(
+                fallback_units, summarize_prompt, "missing or invalid batch item"
+            )
+            unit_results.update(fallback["unit_results"])
+            calls += fallback["calls"]
+
+        return {
+            "unit_results": unit_results,
+            "calls": calls,
+            "valid_items": valid_items,
+            "fallback_items": len(fallback_units),
+            "batch_failed": bool(fallback_units),
+            "batch_failure_detail": "missing or invalid batch item" if fallback_units else "",
+        }
+
+    def _summarize_files_batched(
+        self,
+        files_to_process: list,
+        summarize_prompt: str,
+        batch_size: int,
+        worker_count: int,
+    ) -> list:
+        """Run opt-in batch summaries and restore exact file/chunk ordering."""
+        # Ensure direct/internal callers receive the complete metric schema too.
+        for metric in (
+            "summary_batch_requests",
+            "summary_batch_items",
+            "summary_batch_valid_items",
+            "summary_batch_fallback_items",
+            "summary_batch_failures",
+        ):
+            self._metric_add(metric, 0)
+        prepared_files = []
+        units = []
+        for file_index, file_path in enumerate(files_to_process):
+            prepared = self._summary_chunks_for_file(file_path)
+            prepared_files.append({
+                "parts": [None] * len(prepared["chunks"]),
+                "errors": list(prepared["errors"]),
+            })
+            for chunk_index, chunk in enumerate(prepared["chunks"]):
+                units.append({
+                    "id": self._summary_unit_id(file_index, file_path, chunk_index),
+                    "file_index": file_index,
+                    "file_path": file_path,
+                    "chunk_index": chunk_index,
+                    "chunk": chunk,
+                })
+
+        groups = [
+            units[index:index + batch_size]
+            for index in range(0, len(units), batch_size)
+        ]
+        # A trailing singleton uses the established individual prompt/cache key;
+        # wrapping one item in a batch cannot save a call and only adds parse risk.
+        batches = [group for group in groups if len(group) > 1]
+        singleton_units = [group[0] for group in groups if len(group) == 1]
+        batch_outcomes = [None] * len(batches)
+        if worker_count == 1 or len(batches) <= 1:
+            for index, batch in enumerate(batches):
+                batch_outcomes[index] = self._summarize_batch(batch, summarize_prompt)
+        else:
+            log.info(
+                f"Summarizing {len(units)} item(s) in {len(batches)} batch(es) "
+                f"with {worker_count} worker(s)..."
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_to_index = {
+                    executor.submit(self._summarize_batch, batch, summarize_prompt): index
+                    for index, batch in enumerate(batches)
+                }
+                for future in track(
+                    concurrent.futures.as_completed(future_to_index),
+                    total=len(future_to_index),
+                    description="Summarizing batches...",
+                    console=console,
+                ):
+                    index = future_to_index[future]
+                    try:
+                        batch_outcomes[index] = future.result()
+                    except Exception as exc:
+                        batch_outcomes[index] = self._fallback_summary_batch(
+                            batches[index], summarize_prompt, f"worker exception: {exc}"
+                        )
+
+        self._metric_add("summary_batch_requests", len(batches))
+        self._metric_add("summary_batch_items", sum(len(batch) for batch in batches))
+        for batch, outcome in zip(batches, batch_outcomes):
+            if outcome is None:
+                outcome = self._fallback_summary_batch(
+                    batch, summarize_prompt, "missing batch worker result"
+                )
+            self._metric_add("summarization_calls", outcome["calls"])
+            self._metric_add("summary_batch_valid_items", outcome["valid_items"])
+            self._metric_add("summary_batch_fallback_items", outcome["fallback_items"])
+            if outcome["batch_failed"]:
+                self._metric_add("summary_batch_failures")
+            for unit in batch:
+                unit_result = outcome["unit_results"][unit["id"]]
+                state = prepared_files[unit["file_index"]]
+                state["parts"][unit["chunk_index"]] = unit_result["summary"]
+                state["errors"].extend(unit_result["errors"])
+
+        for unit in singleton_units:
+            unit_result = self._summarize_unit(
+                unit["file_path"], unit["chunk"], summarize_prompt
+            )
+            self._metric_add("summarization_calls", unit_result["calls"])
+            state = prepared_files[unit["file_index"]]
+            state["parts"][unit["chunk_index"]] = unit_result["summary"]
+            state["errors"].extend(unit_result["errors"])
+
+        return [
+            {
+                "summary": "\n".join(part for part in state["parts"] if part),
+                "errors": state["errors"],
+                "calls": 0,
+            }
+            for state in prepared_files
+        ]
+
+    def summarize_chunks(
+        self,
+        decompiled_dir: str,
+        file_list: list = None,
+        summary_workers: int = 1,
+        summary_batch_size: int = 1,
+    ):
         log.info("Starting code summarization...")
         summaries = {}
         summarize_prompt = self._load_summarize_prompt()
@@ -1121,37 +2528,78 @@ class Engine:
                     if file.endswith(".smali"):
                         files_to_process.append(os.path.join(root, file))
 
-        for file_path in track(files_to_process, description="Summarizing code...", console=console):
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
+        # Config validation bounds production values to 1..32. Clamp again here so
+        # direct/internal callers cannot accidentally create an unbounded executor.
+        worker_count = max(1, min(32, int(summary_workers or 1)))
+        batch_size = max(1, min(32, int(summary_batch_size or 1)))
+        outcomes = [None] * len(files_to_process)
 
-            # Chunk by class only for Smali, where each class is its own ".class " block.
-            # Java/Kotlin sources (JADX/hybrid) don't use that token — splitting on it would
-            # either leave the whole file as one misleadingly-prefixed chunk or mis-slice at
-            # class literals (e.g. `Foo.class ==`), so treat the file as a single chunk.
-            if file_path.endswith(".smali"):
-                chunks = [".class " + c for c in content.split(".class ") if c.strip()]
-            else:
-                chunks = [content] if content.strip() else []
-
-            # [FIX #3] Accumulate every chunk's summary per file instead of overwriting.
-            # A multi-class Smali file has several ".class" chunks; keeping only the last
-            # one lost context used by risk identification and cross-reference injection.
-            file_summaries = []
-            for full_chunk in chunks:
-                context = {
-                    "system_prompt": "",
-                    "vuln_prompt": summarize_prompt,
-                    "file_path": file_path
+        if batch_size > 1:
+            outcomes = self._summarize_files_batched(
+                files_to_process,
+                summarize_prompt,
+                batch_size,
+                worker_count,
+            )
+        elif worker_count == 1:
+            for index, file_path in enumerate(track(
+                files_to_process,
+                description="Summarizing code...",
+                console=console,
+            )):
+                outcomes[index] = self._summarize_file(file_path, summarize_prompt)
+        else:
+            log.info(f"Summarizing code with {worker_count} worker(s)...")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_to_index = {
+                    executor.submit(self._summarize_file, file_path, summarize_prompt): index
+                    for index, file_path in enumerate(files_to_process)
                 }
+                for future in track(
+                    concurrent.futures.as_completed(future_to_index),
+                    total=len(future_to_index),
+                    description="Summarizing code...",
+                    console=console,
+                ):
+                    index = future_to_index[future]
+                    try:
+                        outcomes[index] = future.result()
+                    except Exception as exc:
+                        # Unexpected worker failures remain fail-open. KeyboardInterrupt
+                        # and other BaseException subclasses are deliberately not caught,
+                        # so run() cannot publish a false Completed report on interruption.
+                        outcomes[index] = {
+                            "summary": "",
+                            "errors": [{"reason": "exception", "detail": str(exc)}],
+                            "calls": 0,
+                        }
 
-                # [#5] Cap oversized chunks before summarization too.
-                summary = self.llm_client.analyze_code(self._truncate_for_llm(full_chunk), context)
-                if summary and summary.strip():
-                    file_summaries.append(summary.strip())
-                log.debug(f"Summary for {file_path}: {summary}")
-
-            summaries[file_path] = "\n".join(file_summaries)
+        # Merge only on the main thread and strictly in the original candidate order.
+        # This preserves summary dict order used by dependency/app/attack-surface context.
+        for index, file_path in enumerate(files_to_process):
+            outcome = outcomes[index] or {
+                "summary": "",
+                "errors": [{"reason": "exception", "detail": "missing worker result"}],
+                "calls": 0,
+            }
+            self._metric_add("summarization_calls", outcome["calls"])
+            for error in outcome["errors"]:
+                reason = error["reason"]
+                detail = error.get("detail", "")
+                if reason == "empty":
+                    log.warning(
+                        f"Summarization returned an empty response for {file_path}; "
+                        "candidate will be kept."
+                    )
+                else:
+                    log.warning(
+                        f"Summarization failed for {file_path}; candidate will be kept: "
+                        f"{detail or reason}"
+                    )
+                self._record_pipeline_error(
+                    file_path, "summarization", reason, detail
+                )
+            summaries[file_path] = outcome["summary"]
 
         log.success("Code summarization complete.")
         return summaries
@@ -1168,24 +2616,61 @@ class Engine:
                 "file_path": file_path
             }
             
-            response = self.llm_client.analyze_code(summary, context)
-            
-            if "yes" in response.lower():
+            # A missing summary is already an analysis failure. Do not ask the triage
+            # model to judge empty evidence; keep the candidate for rule analysis.
+            if not summary or not summary.strip():
+                self._record_pipeline_error(file_path, "risk_triage", "missing_summary")
+                self._metric_add("triage_errors")
+                risky_files.append(file_path)
+                log.debug(f"Fail-open risk triage for {file_path}: summary unavailable.")
+                continue
+
+            try:
+                self._metric_add("risk_triage_calls")
+                response = self.llm_client.analyze_code(summary, context)
+            except Exception as exc:
+                log.warning(f"Risk triage failed for {file_path}; candidate will be kept: {exc}")
+                reason = "timeout" if isinstance(exc, TimeoutError) else "exception"
+                self._record_pipeline_error(file_path, "risk_triage", reason, str(exc))
+                self._metric_add("triage_errors")
+                risky_files.append(file_path)
+                continue
+
+            normalized = response.strip().lower() if response else ""
+            if normalized.startswith("yes"):
+                self._metric_add("triage_yes")
                 risky_files.append(file_path)
                 log.debug(f"Identified risky file: {file_path}")
+            elif normalized.startswith("no"):
+                self._metric_add("triage_no")
+                # A valid negative remains useful for ordering, but hybrid selection
+                # no longer treats it as authority to discard a static candidate.
+                log.debug(f"Risk triage deprioritized file: {file_path}")
+            else:
+                reason = "empty" if not normalized else "unparseable"
+                log.warning(f"Risk triage returned {reason} output for {file_path}; candidate will be kept.")
+                self._record_pipeline_error(file_path, "risk_triage", reason)
+                self._metric_add("triage_errors")
+                risky_files.append(file_path)
 
         log.success(f"Identified {len(risky_files)} risky files.")
         return risky_files
 
+    @staticmethod
+    def _select_deep_scan_targets(candidates: list, llm_risky: list, pattern_risky: list = None) -> list:
+        """Prioritize triage/static hits without allowing triage to delete candidates."""
+        return list(dict.fromkeys(llm_risky + (pattern_risky or []) + candidates))
+
     def _pattern_matched_files(self, files: list, patterns: list, app_package_name: str = "") -> list:
-        """First-party files whose content matches an enabled rule's detection_pattern.
+        """In-scope files whose content matches an enabled rule's detection_pattern.
 
         A static pattern hit is a STRONG signal, so these files must reach the deep-scan
         (where per-rule gating + the rule LLM decide the verdict) and must NOT be dropped
         by the coarse LLM risk-triage. Layer-2 bug this fixes: ZipSlipActivity matched the
         zip_slip pattern yet identify_risky_chunks judged it "not risky" and dropped it
-        before any rule ran. Scoped to the app package so the added deep-scan cost stays
-        bounded to first-party code (library files still go through the normal triage).
+        before any rule ran. The caller has already applied `_is_relevant_file`; repeating
+        scope here using only the exact manifest-package path lost sibling and obfuscated
+        app namespaces. `app_package_name` remains for call compatibility only.
         """
         import re
         compiled = []
@@ -1196,15 +2681,13 @@ class Engine:
                 continue
         if not compiled:
             return []
-        pkg_frag = app_package_name.replace(".", os.sep) if app_package_name else None
         hits = []
         for f in files:
-            if pkg_frag and pkg_frag not in f:
-                continue  # only rescue first-party files from the risk-triage
             try:
                 with open(f, "r", encoding="utf-8", errors="ignore") as fh:
                     content = fh.read()
             except OSError:
+                self._record_pipeline_error(f, "static_pattern_rescue", "file_read_error")
                 continue
             if any(rx.search(content) for rx in compiled):
                 hits.append(f)
@@ -1212,23 +2695,36 @@ class Engine:
 
     def summarize_app(self, manifest_path: str, summaries: dict):
         log.info("Summarizing application capabilities...")
-        
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            manifest = f.read()
-            
-        summaries_text = "\n".join(f"- {file_path}: {summary}" for file_path, summary in summaries.items())
-        
-        prompt = self._load_app_summary_prompt().format(manifest=manifest, summaries=summaries_text)
-        # Escape curly braces to prevent double formatting issues in analyze_code
-        prompt = prompt.replace("{", "{{").replace("}", "}}")
-        
-        context = {
-            "system_prompt": "",
-            "vuln_prompt": prompt,
-            "file_path": manifest_path
-        }
-        
-        app_summary = self.llm_client.analyze_code("", context)
+
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = f.read()
+
+            summaries_text = "\n".join(f"- {file_path}: {summary}" for file_path, summary in summaries.items())
+
+            prompt = self._load_app_summary_prompt().format(manifest=manifest, summaries=summaries_text)
+            # Escape curly braces to prevent double formatting issues in analyze_code
+            prompt = prompt.replace("{", "{{").replace("}", "}}")
+
+            context = {
+                "system_prompt": "",
+                "vuln_prompt": prompt,
+                "file_path": manifest_path
+            }
+
+            self._metric_add("app_summary_calls")
+            app_summary = self.llm_client.analyze_code("", context)
+        except Exception as exc:
+            reason = "timeout" if isinstance(exc, TimeoutError) else "exception"
+            log.error(f"Application summarization raised {reason}: {exc}")
+            self._record_pipeline_error(manifest_path, "app_summary", reason, str(exc))
+            return ""
+
+        if self._is_failed_response(app_summary):
+            log.warning("Application summarization returned an empty response.")
+            self._record_pipeline_error(manifest_path, "app_summary", "empty")
+            return ""
+
         log.success("Application capabilities summarized.")
         return app_summary
 
@@ -1240,31 +2736,45 @@ class Engine:
         the per-file vulnerability findings already carry the detailed explanations."""
         log.info("Generating attack surface map...")
 
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            manifest = f.read()
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = f.read()
 
-        summaries_text = "\n".join(f"- {file_path}: {summary}" for file_path, summary in summaries.items())
+            summaries_text = "\n".join(f"- {file_path}: {summary}" for file_path, summary in summaries.items())
 
-        prompt = self._load_attack_surface_prompt().format(manifest=manifest, summaries=summaries_text)
-        # Escape curly braces to prevent double formatting issues in analyze_code
-        prompt = prompt.replace("{", "{{").replace("}", "}}")
+            prompt = self._load_attack_surface_prompt().format(manifest=manifest, summaries=summaries_text)
+            # Escape curly braces to prevent double formatting issues in analyze_code
+            prompt = prompt.replace("{", "{{").replace("}", "}}")
 
-        context = {
-            "system_prompt": "",
-            "vuln_prompt": prompt,
-            "file_path": manifest_path,
-            "expect_json": True  # force JSON mode on providers that support it (e.g. Ollama)
-        }
+            context = {
+                "system_prompt": "",
+                "vuln_prompt": prompt,
+                "file_path": manifest_path,
+                "expect_json": True  # force JSON mode on providers that support it (e.g. Ollama)
+            }
 
-        raw_result = self.llm_client.analyze_code("", context)
+            self._metric_add("attack_surface_calls")
+            raw_result = self.llm_client.analyze_code("", context)
+        except Exception as exc:
+            reason = "timeout" if isinstance(exc, TimeoutError) else "exception"
+            log.error(f"Attack surface map generation raised {reason}: {exc}")
+            self._record_pipeline_error(manifest_path, "attack_surface", reason, str(exc))
+            return {"error": f"Attack surface generation failed ({reason})"}
 
         if self._is_failed_response(raw_result):
             log.warning("Attack surface map generation failed (empty LLM response).")
+            self._record_pipeline_error(manifest_path, "attack_surface", "empty")
             return {"error": "LLM call failed (empty response)"}
 
         parsed = self._parse_llm_response(raw_result)
         if parsed.get("_parse_failed"):
             log.warning("Attack surface map response was not valid JSON.")
+            self._record_pipeline_error(
+                manifest_path,
+                "attack_surface",
+                "unparseable",
+                raw_response=raw_result,
+            )
             return {"error": "Unparseable LLM output", "raw": raw_result[:500]}
 
         log.success("Attack surface map generated.")
@@ -1287,57 +2797,227 @@ class Engine:
              pass
         return None
 
+    def _collect_static_candidates(
+        self,
+        decomp_mode: str,
+        smali_dir: str,
+        java_dir: str,
+        rule_keywords: list,
+        rule_patterns: list,
+        strict_mode: bool,
+    ) -> list:
+        """Collect standard rule candidates, then add library-specific candidates.
+
+        `scan_libraries` is additive: enabling it must never replace the candidate set
+        built from active vulnerability rules.
+        """
+        if decomp_mode in ("jadx", "hybrid") and os.path.exists(java_dir):
+            scan_root, source_mode = java_dir, "java"
+        else:
+            if decomp_mode == "jadx":
+                log.error("JADX sources not found. Falling back to Smali.")
+            scan_root, source_mode = smali_dir, "smali"
+
+        standard_filter = CodeFilter(
+            scan_root,
+            mode=source_mode,
+            additional_keywords=rule_keywords,
+            additional_regex=rule_patterns,
+            strict_mode=strict_mode,
+        )
+        standard_targets = standard_filter.find_high_value_targets()
+
+        if not self.settings.analysis.scan_libraries:
+            return standard_targets
+
+        library_patterns = []
+        lib_prompt_path = "config/prompts/vuln_rules/library_vulnerability.yaml"
+        if os.path.exists(lib_prompt_path):
+            with open(lib_prompt_path, "r") as f:
+                library_data = yaml.safe_load(f) or {}
+            if library_data.get("detection_pattern"):
+                library_patterns.append(library_data["detection_pattern"])
+
+        log.info("Library Hunter Mode: adding strict library candidates to the standard candidate set.")
+        library_filter = CodeFilter(
+            scan_root,
+            mode=source_mode,
+            additional_keywords=[],
+            additional_regex=library_patterns,
+            strict_mode=True,
+        )
+        library_targets = library_filter.find_high_value_targets()
+        return list(dict.fromkeys(standard_targets + library_targets))
+
+    def _resolve_active_rules(self, rules: str = None) -> list:
+        """Return enabled rules, optionally narrowed by an explicit CLI selection.
+
+        Explicit `--rules` is an operator-requested scope restriction, not permission
+        to enable rules disabled in settings. Whitespace is normalized, while rule names
+        remain case-sensitive and otherwise unchanged.
+        """
+        configured = self.settings.rules.model_dump()
+        enabled_rules = [name for name, enabled in configured.items() if enabled]
+        if rules is None:
+            return enabled_rules
+
+        requested = list(dict.fromkeys(part.strip() for part in rules.split(",") if part.strip()))
+        known = set(configured)
+        unknown = [name for name in requested if name not in known]
+        if unknown:
+            log.warning(f"Ignoring unknown explicitly requested rule(s): {', '.join(unknown)}")
+
+        disabled = [name for name in requested if name in known and not configured[name]]
+        if disabled:
+            log.warning(
+                "Explicitly requested rule(s) disabled in settings and therefore not active: "
+                + ", ".join(disabled)
+            )
+
+        requested_set = set(requested)
+        return [name for name in enabled_rules if name in requested_set]
+
+    def _load_rule_signals(self, active_rules: list) -> tuple:
+        """Load candidate keywords/regex only for the rules active in this scan."""
+        extra_keywords = []
+        extra_regex = []
+        for rule_name in active_rules:
+            if rule_name in DEDICATED_PASS_RULES:
+                continue
+            try:
+                prompt_path = f"config/prompts/vuln_rules/{rule_name}.yaml"
+                with open(prompt_path, "r") as f:
+                    rule_data = yaml.safe_load(f) or {}
+                extra_keywords.extend(rule_data.get("keywords") or [])
+                if rule_data.get("detection_pattern"):
+                    extra_regex.append(rule_data["detection_pattern"])
+                elif (rule_data.get("static_analysis") or {}).get("patterns"):
+                    extra_regex.extend(rule_data["static_analysis"]["patterns"])
+            except Exception as exc:
+                log.warning(f"Could not load matching logic from {rule_name}: {exc}")
+                self._record_pipeline_error(
+                    f"config/prompts/vuln_rules/{rule_name}.yaml",
+                    "rule_signal_loading",
+                    "exception",
+                    str(exc),
+                )
+
+        # Stable additive deduplication: preserve every distinct signal and its first order.
+        return list(dict.fromkeys(extra_keywords)), list(dict.fromkeys(extra_regex))
+
     def run(self, apk_path: str, output_file: str = None, no_decompile: bool = False, rules: str = None):
         log.info(f"Starting analysis of {apk_path}...")
-        
-        rules_to_run = rules.split(',') if rules else None
-        
-        # [V1.1.4] XAPK Auto-Extraction Support
-        if apk_path.lower().endswith(".xapk"):
-             log.info(f"Detected XAPK file: {apk_path}. Attempting to extract...")
-             xapk_name = os.path.basename(apk_path)
-             temp_extract_dir = f"output/temp_xapk_{xapk_name}"
-             os.makedirs(temp_extract_dir, exist_ok=True)
-             
-             try:
-                 with zipfile.ZipFile(apk_path, 'r') as zip_ref:
-                     zip_ref.extractall(temp_extract_dir)
-                 
-                 # Find the largest .apk file (heuristically the base/main APK)
-                 largest_apk = None
-                 max_size = 0
-                 
-                 for root, dirs, files in os.walk(temp_extract_dir):
-                     for file in files:
-                         if file.lower().endswith(".apk"):
-                             full_path = os.path.join(root, file)
-                             size = os.path.getsize(full_path)
-                             if size > max_size:
-                                 max_size = size
-                                 largest_apk = full_path
-                 
-                 if largest_apk:
-                     log.success(f"Extracted XAPK and selected main APK: {largest_apk}")
-                     apk_path = largest_apk # Override valid APK path
-                 else:
-                     log.error("Could not find any .apk file inside the XAPK archive.")
-                     return # Abort
-                     
-             except zipfile.BadZipFile:
-                 log.error(f"Failed to extract XAPK: {apk_path} is not a valid zip file.")
-                 return
-             except Exception as e:
-                 log.error(f"Error handling XAPK: {e}")
-                 return
 
-        self.apk_name = os.path.basename(apk_path) # Store for later use
+        # Reset per-run state before any LLM-backed pipeline stage. Resetting this after
+        # summarization used to erase failures and could make an incomplete scan look clean.
+        self.vulnerability_findings = []
+        self.poc_results = []
+        self.analysis_errors = []
+        self._metrics_lock = threading.Lock()
+        self.scan_metrics = {
+            "decompiled_code_files": 0,
+            "candidates_raw": 0,
+            "candidates_scoped": 0,
+            "summaries_requested": 0,
+            "summaries_nonempty": 0,
+            "summarization_calls": 0,
+            "summary_batch_size": 1,
+            "summary_batch_requests": 0,
+            "summary_batch_items": 0,
+            "summary_batch_valid_items": 0,
+            "summary_batch_fallback_items": 0,
+            "summary_batch_failures": 0,
+            "risk_triage_calls": 0,
+            "hybrid_risk_triage": "not_applicable",
+            "app_summary_calls": 0,
+            "attack_surface_calls": 0,
+            "triage_yes": 0,
+            "triage_no": 0,
+            "triage_errors": 0,
+            "static_pattern_hits": 0,
+            "deep_scan_targets": 0,
+            "deep_rule_checks": 0,
+            "deep_rule_checks_scheduled": 0,
+            "deep_rule_checks_accounted": 0,
+            "deep_rule_checks_completed": 0,
+            "deep_rule_checks_vulnerable": 0,
+            "deep_rule_checks_not_vulnerable": 0,
+            "deep_rule_checks_error": 0,
+            "deep_rule_accounting_complete": True,
+            "deep_scan_priority": "candidate_order",
+            "deep_scan_files_scheduled": 0,
+            "deep_scan_files_completed": 0,
+            "deep_scan_files_error": 0,
+            "deep_scan_file_accounting_complete": True,
+            "manifest_rule_checks": 0,
+            "strings_rule_checks": 0,
+            "exploit_attempts": 0,
+            "exploit_generated": 0,
+            "exploit_successes": 0,
+            "exploit_errors": 0,
+            "exploit_validation_errors": 0,
+            "candidate_collection_seconds": 0.0,
+            "summarization_seconds": 0.0,
+            "risk_triage_seconds": 0.0,
+            "app_summary_seconds": 0.0,
+            "attack_surface_seconds": 0.0,
+            "deep_scan_seconds": 0.0,
+        }
+        
+        active_rules = self._resolve_active_rules(rules)
+        log.info(f"Active vulnerability rules: {len(active_rules)}")
+        
+        # XAPK/APKS preprocessing is additive to the existing APK path. Extraction uses
+        # a fresh temp directory so a previous failed run cannot contribute a stale APK.
+        original_input_path = apk_path
+        archive_ext = os.path.splitext(apk_path)[1].lower()
+        output_basename = os.path.basename(apk_path)
+        bundle_extract_dir = None
+        bundle_error = None
+        if archive_ext in self.BUNDLE_EXTENSIONS:
+            label = archive_ext.lstrip(".").upper()
+            log.info(f"Detected {label} bundle: {apk_path}. Attempting safe extraction...")
+            try:
+                os.makedirs("output", exist_ok=True)
+                bundle_extract_dir = tempfile.mkdtemp(prefix=f"dlh_{label.lower()}_", dir="output")
+                self._safe_extract_bundle(apk_path, bundle_extract_dir)
+                selected_apk = self._select_bundle_apk(bundle_extract_dir)
+                if not selected_apk:
+                    bundle_error = ("no_apk", f"No APK found inside {label} archive")
+                else:
+                    apk_path = selected_apk
+                    selected_name = os.path.basename(selected_apk)
+                    log.success(f"Extracted {label} and selected APK: {selected_apk}")
+                    # Preserve the established XAPK output naming. APKS output remains
+                    # tied to the archive because every split bundle tends to use the
+                    # same inner filename (base-master.apk).
+                    if archive_ext == ".xapk":
+                        output_basename = selected_name
+                    elif selected_name.lower() != "universal.apk":
+                        # Scanning base-master is still useful and strictly additive, but
+                        # feature splits are not silently declared analyzed.
+                        self._record_pipeline_error(
+                            original_input_path,
+                            "bundle_selection",
+                            "partial_split_scan",
+                            "APKS has no universal.apk; scanning the selected base APK only. "
+                            "Dynamic-feature splits remain unanalyzed.",
+                        )
+            except zipfile.BadZipFile as exc:
+                bundle_error = ("invalid_archive", str(exc))
+            except ValueError as exc:
+                bundle_error = ("unsafe_archive", str(exc))
+            except Exception as exc:
+                bundle_error = ("exception", str(exc))
+
+        self.apk_name = output_basename # Store for later use
         apk_name = self.apk_name
         output_dir = f"output/{apk_name}_decompiled"
         
         # [Moved from end] Calculate unique output file/dir options EARLY
         if output_file is None:
-            base_filename = f"{os.path.basename(apk_path)}_results.json"
-            base_exploit_dir_name = f"{os.path.basename(apk_path).replace('.apk', '')}_exploits"
+            base_filename = f"{output_basename}_results.json"
+            base_exploit_dir_name = f"{os.path.splitext(output_basename)[0]}_exploits"
             
             # Initial candidates
             candidate_file = f"output/{base_filename}"
@@ -1357,74 +3037,137 @@ class Engine:
             self.final_output_file = output_file
             filename_no_ext = os.path.splitext(os.path.basename(output_file))[0]
             self.final_exploit_dir = f"output/{filename_no_ext}_exploits"
+
+        if bundle_error:
+            reason, detail = bundle_error
+            self._record_pipeline_error(original_input_path, "bundle_extraction", reason, detail)
+            self._write_failed_scan_report()
+            if bundle_extract_dir:
+                shutil.rmtree(bundle_extract_dir, ignore_errors=True)
+            return
         
         decomp_mode = self.settings.analysis.decompiler_mode
         log.info(f"Decompiler Mode: {decomp_mode}")
 
         if not no_decompile:
-            os.makedirs(output_dir, exist_ok=True)
-            
+            # Apktool uses -f and clears its destination. Work in staging so Ctrl+C,
+            # tool failure, or malformed input never destroys a previous good tree.
+            staging_dir = f"{output_dir}.partial"
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            os.makedirs(staging_dir, exist_ok=True)
+
             # 1. Always run Apktool (Need Manifest + Resources + Smali Fallback)
             log.info("Running Apktool...")
-            decompiler = ApktoolHandler(apktool_path=self.settings.apktool.path or "apktool")
-            decompiler.decompile(apk_path, output_dir)
-            
+            try:
+                decompiler = ApktoolHandler(apktool_path=self.settings.apktool.path or "apktool")
+                decompiler.decompile(apk_path, staging_dir)
+            except Exception as exc:
+                reason = "timeout" if isinstance(exc, TimeoutError) else "exception"
+                self._record_pipeline_error(apk_path, "apktool_decompilation", reason, str(exc))
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                self._write_failed_scan_report()
+                if bundle_extract_dir:
+                    shutil.rmtree(bundle_extract_dir, ignore_errors=True)
+                return
+
             # 2. Run JADX if needed
             if decomp_mode in ["jadx", "hybrid"]:
                 log.info("Running JADX...")
-                jadx_path = self.settings.jadx.path if self.settings.jadx else None
-                jadx = JadxHandler(jadx_path=jadx_path)
-                # JADX typically outputs to 'sources' dir inside output_dir when -d is used? 
-                # Handler uses -d output_dir. Jadx usually creates 'sources' structure.
-                # Let's ensure JadxHandler puts it in output_dir/sources or we handle it.
-                # Our handler: cmd = [self.jadx_path, "-d", output_dir, ...]
-                # Jadx default behavior: creates 'sources' folder inside output_dir.
-                jadx.decompile(apk_path, output_dir)
+                try:
+                    jadx_path = self.settings.jadx.path if self.settings.jadx else None
+                    jadx = JadxHandler(jadx_path=jadx_path)
+                    jadx_ok = jadx.decompile(apk_path, staging_dir)
+                except Exception as exc:
+                    jadx_ok = False
+                    self._record_pipeline_error(
+                        apk_path,
+                        "jadx_decompilation",
+                        "exception",
+                        str(exc),
+                    )
+                if not jadx_ok:
+                    # Apktool output is still available, so continue through the Smali
+                    # fallback while making the partial JADX failure explicit.
+                    if not any(
+                        error.get("stage") == "jadx_decompilation" and error.get("file") == apk_path
+                        for error in self.analysis_errors
+                    ):
+                        self._record_pipeline_error(apk_path, "jadx_decompilation", "no_sources")
+
+            if not self._publish_decompile(staging_dir, output_dir, apk_path):
+                self._record_pipeline_error(
+                    apk_path,
+                    "decompile_publication",
+                    "incomplete_output",
+                )
+                self._write_failed_scan_report()
+                if bundle_extract_dir:
+                    shutil.rmtree(bundle_extract_dir, ignore_errors=True)
+                return
+
+        if bundle_extract_dir:
+            shutil.rmtree(bundle_extract_dir, ignore_errors=True)
+            bundle_extract_dir = None
+
+        manifest_path = os.path.join(output_dir, "AndroidManifest.xml")
+        if not os.path.exists(manifest_path):
+            detail = self._describe_decompile_dir(output_dir)
+            log.error(f"Cannot scan '{output_dir}': {detail}.")
+            self._record_pipeline_error(
+                output_dir,
+                "decompile_validation",
+                "missing_manifest",
+                detail,
+            )
+            self._write_failed_scan_report()
+            return
+
+        try:
+            self.scan_metrics["decompiled_code_files"] = sum(
+                1
+                for root, _, files in os.walk(output_dir)
+                for filename in files
+                if filename.endswith((".java", ".smali"))
+            )
+        except Exception as exc:
+            self._record_pipeline_error(output_dir, "metrics", "file_count_error", str(exc), status="Error")
 
         # BUILD CALL GRAPH (Only supports Smali for now)
         if self.settings.analysis.use_cross_reference_context:
-            self.call_graph_builder = CallGraphBuilder(output_dir)
-            self.call_graph_builder.build()
+            try:
+                self.call_graph_builder = CallGraphBuilder(output_dir)
+                self.call_graph_builder.build()
+            except Exception as exc:
+                log.error(f"Call graph generation failed; continuing without dependency context: {exc}")
+                self._record_pipeline_error(output_dir, "call_graph", "exception", str(exc))
+                self.call_graph_builder = None
         else:
             self.call_graph_builder = None
 
-        smali_rules_enabled = any(
-            enabled and rule_name not in DEDICATED_PASS_RULES
-            for rule_name, enabled in self.settings.rules.model_dump().items()
-        )
+        smali_rules_enabled = any(rule_name not in DEDICATED_PASS_RULES for rule_name in active_rules)
 
         self.summaries = {}
         target_files = [] # Files we will actually scan (either .smali or .java)
+        # Dedicated strings analysis is independent of whether code rules find targets.
+        try:
+            strings_results = self.analyze_strings_xml(output_dir, active_rules)
+        except Exception as exc:
+            reason = "timeout" if isinstance(exc, TimeoutError) else "exception"
+            log.error(f"strings.xml analysis failed: {exc}")
+            strings_results = [self._build_error_result(
+                output_dir,
+                "hardcoded_secrets_xml",
+                "Hardcoded Secrets (strings.xml)",
+                reason=reason,
+                detail=str(exc),
+            )]
         
         if smali_rules_enabled:
             filter_mode = self.settings.analysis.filter_mode
             log.info(f"Using filter mode: {filter_mode}")
 
             # --- DYNAMIC KEYWORD & REGEX GATHERING ---
-            extra_keywords = []
-            extra_regex = [] # [V1.2] Regex Support
-            for rule_name, enabled in self.settings.rules.model_dump().items():
-                if enabled and rule_name not in DEDICATED_PASS_RULES:
-                     try:
-                        prompt_path = f"config/prompts/vuln_rules/{rule_name}.yaml"
-                        with open(prompt_path, "r") as f:
-                            rule_data = yaml.safe_load(f)
-                            if "keywords" in rule_data and rule_data["keywords"]:
-                                extra_keywords.extend(rule_data["keywords"])
-                            
-                            # [V1.2] Support for 'detection_pattern' (regex) and 'static_analysis' block
-                            if "detection_pattern" in rule_data and rule_data["detection_pattern"]:
-                                extra_regex.append(rule_data["detection_pattern"])
-                            elif "static_analysis" in rule_data:
-                                if "patterns" in rule_data["static_analysis"]:
-                                    extra_regex.extend(rule_data["static_analysis"]["patterns"])
-                                    
-                     except Exception as e:
-                         log.warning(f"Could not load matching logic from {rule_name}: {e}")
-            
-            # Deduplicate
-            extra_keywords = list(set(extra_keywords))
-            extra_regex = list(set(extra_regex))
+            extra_keywords, extra_regex = self._load_rule_signals(active_rules)
             
             if extra_keywords:
                 log.info(f"Loaded high-value keywords: {len(extra_keywords)}")
@@ -1443,6 +3186,7 @@ class Engine:
                     log.info(f"Identified App Package: {app_package_name}")
                 except Exception as e:
                     log.warning(f"Failed to parse package name: {e}")
+                    self._record_pipeline_error(manifest_path, "manifest_parsing", "exception", str(e))
 
             # --- STRATEGY SELECTION ---
             
@@ -1452,62 +3196,33 @@ class Engine:
             java_dir = os.path.join(output_dir, "sources") 
             
             potential_targets = []
+            candidate_collection_started = self._metric_timer_start()
             
-            # A. STATIC FILTER PHASE
             # A. STATIC FILTER PHASE
             if filter_mode in ["static_only", "hybrid"]:
                 use_strict = (filter_mode == "hybrid")
-                
-                # [V1.1.7 Optimization] Library Hunter Strict Mode
-                # If Library Scan is requested, we override standards to be VERY STRICT.
-                # We do NOT want generic 'WebView' or 'File' keywords matching 100 library files.
-                # We ONLY want 'readObject', 'DexClassLoader', etc.
-                if self.settings.analysis.scan_libraries:
-                    log.info("Library Hunter Mode: Enforcing STRICT regex targeting to save tokens.")
-                    
-                    # 1. Load ONLY the library regex
-                    strict_lib_regex = []
-                    lib_prompt_path = "config/prompts/vuln_rules/library_vulnerability.yaml"
-                    if os.path.exists(lib_prompt_path):
-                         with open(lib_prompt_path, "r") as f:
-                             d = yaml.safe_load(f)
-                             if "detection_pattern" in d:
-                                 strict_lib_regex.append(d["detection_pattern"])
-                    
-                    # 2. Run CodeFilter in STRICT MODE (No default keywords)
-                    # Support JADX or HYBRID (if Java sources exist)
-                    if decomp_mode in ["jadx", "hybrid"] and os.path.exists(java_dir):
-                        cf = CodeFilter(java_dir, mode="java", additional_keywords=[], additional_regex=strict_lib_regex, strict_mode=True)
-                        potential_targets = cf.find_high_value_targets()
-                    # Fallback to Smali (Apktool or missing Java sources)
-                    else:
-                        cf = CodeFilter(smali_dir, mode="smali", additional_keywords=[], additional_regex=strict_lib_regex, strict_mode=True)
-                        potential_targets = cf.find_high_value_targets()
-                     
-                else:
-                    # Standard Mode (Broad)
-                    if decomp_mode == "apktool":
-                        cf = CodeFilter(smali_dir, mode="smali", additional_keywords=extra_keywords, additional_regex=extra_regex, strict_mode=use_strict)
-                        potential_targets = cf.find_high_value_targets()
-                        
-                    elif decomp_mode == "jadx":
-                        if os.path.exists(java_dir):
-                            cf = CodeFilter(java_dir, mode="java", additional_keywords=extra_keywords, additional_regex=extra_regex, strict_mode=use_strict)
-                            potential_targets = cf.find_high_value_targets()
-                        else:
-                            log.error("JADX sources not found. Falling back to Smali.")
-                            cf = CodeFilter(smali_dir, mode="smali", additional_keywords=extra_keywords, additional_regex=extra_regex, strict_mode=use_strict)
-                            potential_targets = cf.find_high_value_targets()
-
-                    elif decomp_mode == "hybrid":
-                        # HYBRID DECOMPILER + HYBRID FILTER
-                        if os.path.exists(java_dir):
-                            cf = CodeFilter(java_dir, mode="java", additional_keywords=extra_keywords, additional_regex=extra_regex, strict_mode=use_strict)
-                            java_targets = cf.find_high_value_targets()
-                            potential_targets = java_targets
-                        else:
-                            cf = CodeFilter(smali_dir, mode="smali", additional_keywords=extra_keywords, additional_regex=extra_regex, strict_mode=use_strict)
-                            potential_targets = cf.find_high_value_targets()
+                try:
+                    potential_targets = self._collect_static_candidates(
+                        decomp_mode,
+                        smali_dir,
+                        java_dir,
+                        extra_keywords,
+                        extra_regex,
+                        use_strict,
+                    )
+                except Exception as exc:
+                    self._metric_record_duration(
+                        "candidate_collection_seconds", candidate_collection_started
+                    )
+                    log.error(f"Static candidate collection failed: {exc}")
+                    self._record_pipeline_error(
+                        output_dir,
+                        "candidate_collection",
+                        "exception",
+                        str(exc),
+                    )
+                    self._write_failed_scan_report()
+                    return
 
             # B. LLM_ONLY PHASE (Get everything)
             else: 
@@ -1524,9 +3239,12 @@ class Engine:
                         for root, _, files in os.walk(java_dir):
                             for file in files:
                                 if file.endswith(".java"): potential_targets.append(os.path.join(root, file))
-            
-            # --- STRINGS.XML ANALYSIS ---
-            strings_results = self.analyze_strings_xml(output_dir, rules_to_run)
+
+            self._metric_record_duration(
+                "candidate_collection_seconds", candidate_collection_started
+            )
+
+            self.scan_metrics["candidates_raw"] = len(potential_targets)
             
             # --- SMART FALLBACK & SELECTION ---
             # Now we have 'potential_targets'. 
@@ -1566,6 +3284,7 @@ class Engine:
                 log.info(f"Scope Filter: Ignored {skipped_count} library/irrelevant files.")
             
             final_targets_for_summary = filtered_targets
+            self.scan_metrics["candidates_scoped"] = len(final_targets_for_summary)
 
             
             # --- SUMMARIZATION & RISK ID PHASE ---
@@ -1576,53 +3295,136 @@ class Engine:
                  
             elif filter_mode == "hybrid":
                 # Static found targets -> Summarize them -> Ask LLM
+                self.scan_metrics["hybrid_risk_triage"] = (
+                    "legacy_enabled"
+                    if self.settings.analysis.hybrid_risk_triage
+                    else "skipped_redundant"
+                )
+                self.scan_metrics["deep_scan_priority"] = "static_pattern_then_scoped_stable"
                 if final_targets_for_summary:
-                    self.summaries = self.summarize_chunks(output_dir, file_list=final_targets_for_summary)
-                    llm_risky = self.identify_risky_chunks(self.summaries)
+                    summarization_started = self._metric_timer_start()
+                    self.summaries = self.summarize_chunks(
+                        output_dir,
+                        file_list=final_targets_for_summary,
+                        summary_workers=self.settings.analysis.summary_workers,
+                        summary_batch_size=getattr(
+                            self.settings.analysis, "summary_batch_size", 1
+                        ),
+                    )
+                    self.scan_metrics["summary_batch_size"] = getattr(
+                        self.settings.analysis, "summary_batch_size", 1
+                    )
+                    self._metric_record_duration("summarization_seconds", summarization_started)
+                    self.scan_metrics["summaries_requested"] = len(final_targets_for_summary)
+                    self.scan_metrics["summaries_nonempty"] = sum(
+                        1 for summary in self.summaries.values() if summary and summary.strip()
+                    )
                     # A first-party file that matches a rule's detection_pattern is a strong
                     # static signal; deep-scan it even if the LLM risk-triage said "no" (it
                     # dropped a real hit — ZipSlipActivity — before any rule could run).
                     pattern_risky = self._pattern_matched_files(
                         final_targets_for_summary, extra_regex, app_package_name
                     )
-                    target_files = list(dict.fromkeys(llm_risky + pattern_risky))
-                    log.info(
-                        f"Deep-scan targets: {len(llm_risky)} via risk-triage + "
-                        f"{len(pattern_risky)} first-party static-pattern hits = "
-                        f"{len(target_files)} unique."
-                    )
+                    if self.settings.analysis.hybrid_risk_triage:
+                        risk_triage_started = self._metric_timer_start()
+                        llm_risky = self.identify_risky_chunks(self.summaries)
+                        self._metric_record_duration(
+                            "risk_triage_seconds", risk_triage_started
+                        )
+                        target_files = self._select_deep_scan_targets(
+                            final_targets_for_summary, llm_risky, pattern_risky
+                        )
+                    else:
+                        llm_risky = []
+                        # Static-pattern files are priority only. Appending the complete
+                        # scoped list keeps membership exhaustive and stable-deduplicated.
+                        target_files = self._select_deep_scan_targets(
+                            final_targets_for_summary, [], pattern_risky
+                        )
+                    self.scan_metrics["static_pattern_hits"] = len(pattern_risky)
+                    self.scan_metrics["deep_scan_targets"] = len(target_files)
+                    if self.settings.analysis.hybrid_risk_triage:
+                        log.info(
+                            f"Deep-scan targets: {len(llm_risky)} via risk-triage + "
+                            f"{len(pattern_risky)} scoped static-pattern hits = "
+                            f"{len(target_files)} unique after fail-open candidate union."
+                        )
+                    else:
+                        log.info(
+                            "Hybrid risk-triage skipped as redundant; "
+                            f"{len(pattern_risky)} static-pattern hits prioritized and all "
+                            f"{len(target_files)} scoped candidates retained."
+                        )
                 else:
                     target_files = []
 
             else: # llm_only
                 # We summarized EVERYTHING (expensive!). 
+                summarization_started = self._metric_timer_start()
                 self.summaries = self.summarize_chunks(output_dir, file_list=final_targets_for_summary)
-                target_files = self.identify_risky_chunks(self.summaries)
+                self._metric_record_duration("summarization_seconds", summarization_started)
+                self.scan_metrics["summaries_requested"] = len(final_targets_for_summary)
+                self.scan_metrics["summaries_nonempty"] = sum(
+                    1 for summary in self.summaries.values() if summary and summary.strip()
+                )
+                risk_triage_started = self._metric_timer_start()
+                llm_risky = self.identify_risky_chunks(self.summaries)
+                self._metric_record_duration("risk_triage_seconds", risk_triage_started)
+                target_files = self._select_deep_scan_targets(final_targets_for_summary, llm_risky)
+                self.scan_metrics["deep_scan_targets"] = len(target_files)
 
+        # Re-assign from the actual list after strategy selection. This is a passive
+        # observation only and is never read back by candidate selection.
+        self.scan_metrics["deep_scan_targets"] = len(target_files)
 
         manifest_path = os.path.join(output_dir, "AndroidManifest.xml")
         
-        # Always attempt to summarize app (even if only based on Manifest)
-        app_summary = self.summarize_app(manifest_path, self.summaries)
-        
+        # The app summary and the attack-surface map are independent report sections:
+        # both read only the manifest and the already-computed summaries, and neither
+        # feeds the other or candidate selection. Running them back to back put two full
+        # LLM round-trips on the critical path for no reason (measured 38s + 5s), so they
+        # are issued concurrently. Each still records its own duration.
+        def _run_app_summary():
+            started = self._metric_timer_start()
+            try:
+                return self.summarize_app(manifest_path, self.summaries)
+            finally:
+                self._metric_record_duration("app_summary_seconds", started)
+
+        def _run_attack_surface():
+            started = self._metric_timer_start()
+            try:
+                return self.generate_attack_surface_map(manifest_path, self.summaries)
+            finally:
+                self._metric_record_duration("attack_surface_seconds", started)
+
         attack_surface_map = None
         if self.settings.analysis.generate_attack_surface_map:
-            attack_surface_map = self.generate_attack_surface_map(manifest_path, self.summaries)
-
-        # Clear previous findings before scan
-        self.vulnerability_findings = []
-        self.analysis_errors = []  # [FIX #2] Reset unanalyzed-file tracker
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as report_pool:
+                summary_future = report_pool.submit(_run_app_summary)
+                surface_future = report_pool.submit(_run_attack_surface)
+                app_summary = summary_future.result()
+                attack_surface_map = surface_future.result()
+        else:
+            app_summary = _run_app_summary()
 
         # Analyze the manifest file
-        all_results = self.analyze_manifest(manifest_path, rules_to_run)
+        try:
+            all_results = self.analyze_manifest(manifest_path, active_rules)
+        except Exception as exc:
+            reason = "timeout" if isinstance(exc, TimeoutError) else "exception"
+            log.error(f"Manifest analysis failed: {exc}")
+            all_results = [self._build_error_result(
+                manifest_path,
+                "__manifest_analysis__",
+                "Manifest Analysis",
+                reason=reason,
+                detail=str(exc),
+            )]
+        if strings_results:
+            all_results.extend(strings_results)
 
         if smali_rules_enabled and target_files:
-            # Append strings.xml results
-            try:
-                if strings_results:
-                    all_results.extend(strings_results)
-            except NameError:
-                pass # strings_results might not be defined if scope skipped
             # Analyze the identified files (may be .smali or .java).
             # Context injection works for both: the call graph is Smali-based, but
             # get_dependencies()/path_to_class() normalize .java paths (sources/) to the
@@ -1630,31 +3432,123 @@ class Engine:
             
             max_workers = max(1, self.settings.analysis.max_workers)  # [#6] Configurable parallelism
             log.info(f"Deep scanning with {max_workers} worker(s)...")
+            deep_scan_started = self._metric_timer_start()
+            self.scan_metrics["deep_scan_files_scheduled"] = len(target_files)
+            ordered_priority_merge = filter_mode == "hybrid"
+            outcomes = [None] * len(target_files)
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_file = {executor.submit(self.analyze_file, file_path, rules_to_run): file_path for file_path in target_files}
-                for future in track(concurrent.futures.as_completed(future_to_file), total=len(future_to_file), description="Deep scanning files...", console=console):
-                    file_path = future_to_file[future]
+                # ThreadPoolExecutor starts work in submission order. target_files is already
+                # stable priority order in hybrid mode, and every target is submitted: priority
+                # never becomes a cutoff or membership gate.
+                future_to_index = {
+                    executor.submit(self.analyze_file, file_path, active_rules): index
+                    for index, file_path in enumerate(target_files)
+                }
+                for future in track(concurrent.futures.as_completed(future_to_index), total=len(future_to_index), description="Deep scanning files...", console=console):
+                    index = future_to_index[future]
+                    file_path = target_files[index]
                     try:
                         results = future.result()
-                        all_results.extend(results)
+                        if ordered_priority_merge:
+                            outcomes[index] = {"results": results, "error": None}
+                        else:
+                            # Preserve the established completion-order merge for
+                            # static_only/llm_only. Phase 4 is hybrid-specific.
+                            all_results.extend(results)
+                        self._metric_add("deep_scan_files_completed")
                     except Exception as exc:
                         log.error(f"{file_path} generated an exception: {exc}")
+                        if ordered_priority_merge:
+                            outcomes[index] = {"results": [], "error": exc}
+                        else:
+                            reason = "timeout" if isinstance(exc, TimeoutError) else "exception"
+                            all_results.append(self._build_error_result(
+                                file_path,
+                                "__file_analysis__",
+                                "File Analysis",
+                                reason=reason,
+                                detail=str(exc),
+                            ))
+                        self._metric_add("deep_scan_files_error")
+
+            # Completion order is nondeterministic, but report order must not be. Merge each
+            # file's result in the exact priority/submission order after every future finished.
+            # This is intentionally hybrid-only so static_only/llm_only behavior is unchanged.
+            if ordered_priority_merge:
+                for index, file_path in enumerate(target_files):
+                    outcome = outcomes[index]
+                    if outcome is None:
+                        outcome = {
+                            "results": [],
+                            "error": RuntimeError("deep-scan worker produced no outcome"),
+                        }
+                        self._metric_add("deep_scan_files_error")
+                    if outcome["error"] is not None:
+                        exc = outcome["error"]
+                        reason = "timeout" if isinstance(exc, TimeoutError) else "exception"
+                        all_results.append(self._build_error_result(
+                            file_path,
+                            "__file_analysis__",
+                            "File Analysis",
+                            reason=reason,
+                            detail=str(exc),
+                        ))
+                    else:
+                        all_results.extend(outcome["results"])
+
+            files_scheduled = self.scan_metrics["deep_scan_files_scheduled"]
+            files_accounted = (
+                self.scan_metrics["deep_scan_files_completed"]
+                + self.scan_metrics["deep_scan_files_error"]
+            )
+            self.scan_metrics["deep_scan_file_accounting_complete"] = (
+                files_scheduled == files_accounted
+            )
+            self._metric_record_duration("deep_scan_seconds", deep_scan_started)
+
+        self.scan_metrics["deep_rule_checks_scheduled"] = self.scan_metrics["deep_rule_checks"]
+        self.scan_metrics["deep_rule_accounting_complete"] = (
+            self.scan_metrics["deep_rule_checks_scheduled"]
+            == self.scan_metrics["deep_rule_checks_accounted"]
+        )
+        if not self.scan_metrics["deep_scan_file_accounting_complete"]:
+            self._record_pipeline_error(
+                self.apk_name,
+                "deep_scan_accounting",
+                "incomplete_file_accounting",
+                "Not every scheduled deep-scan file produced a completed or error outcome.",
+            )
+        if not self.scan_metrics["deep_rule_accounting_complete"]:
+            self._record_pipeline_error(
+                self.apk_name,
+                "deep_scan_accounting",
+                "incomplete_rule_accounting",
+                "Not every started deep-rule LLM check produced a verdict or Error outcome.",
+            )
 
         # [#E] Collapse overlapping same-file findings (info-preserving via 'also_detected_by').
         all_results = self._dedupe_findings(all_results)
 
-        final_report = {
-            "app_summary": app_summary,
-            "attack_surface_map": attack_surface_map,
-            "results": all_results,
-            # [FIX #2] Surface unanalyzed file/rule pairs so a failed scan can't be
-            # mistaken for a clean one.
-            "analysis_errors": self.analysis_errors,
-        }
-
         # [V1.1.3] Generate Chained Exploits (Phase 2)
         if self.settings.analysis.generate_exploit and self.vulnerability_findings:
             self._generate_chained_exploits()
+
+        # Cache failures are non-fatal to analysis, but they must remain visible in
+        # the report instead of existing only in debug logs.
+        self._collect_cache_errors()
+        self._finalize_scan_metrics(all_results)
+
+        final_report = {
+            "scan_status": "CompletedWithErrors" if self.analysis_errors else "Completed",
+            "app_summary": app_summary,
+            "attack_surface_map": attack_surface_map,
+            "results": all_results,
+            "poc_results": self.poc_results,
+            # [FIX #2] Surface unanalyzed file/rule pairs so a failed scan can't be
+            # mistaken for a clean one.
+            "analysis_errors": self.analysis_errors,
+            "scan_metrics": self.scan_metrics,
+        }
 
         # Output the report to the pre-calculated path
         with open(self.final_output_file, "w") as f:
@@ -1666,22 +3560,15 @@ class Engine:
         if self.analysis_errors:
             log.warning(
                 f"{len(self.analysis_errors)} file/rule check(s) could NOT be analyzed "
-                f"(LLM failures). These are marked status='Error' and must NOT be read as clean. "
+                f"or had pipeline errors. These are marked Error/Unanalyzed and must NOT be read as clean. "
                 f"See 'analysis_errors' in the report."
             )
 
         # [#4] Report cache effectiveness. Merge in exploit_llm_client's own stats when it's
         # a separate client (different exploit_provider/exploit_model) so the count is complete.
-        if hasattr(self.llm_client, "cache_stats"):
-            stats = self.llm_client.cache_stats()
-            hits, misses, enabled = stats.get("hits", 0), stats.get("misses", 0), stats.get("enabled")
-            if self.exploit_llm_client is not self.llm_client and hasattr(self.exploit_llm_client, "cache_stats"):
-                exploit_stats = self.exploit_llm_client.cache_stats()
-                hits += exploit_stats.get("hits", 0)
-                misses += exploit_stats.get("misses", 0)
-                enabled = enabled or exploit_stats.get("enabled")
-            if enabled:
-                log.info(f"Response cache: {hits} hit(s), {misses} miss(es).")
+        stats = self._combined_cache_stats()
+        if stats["enabled"]:
+            log.info(f"Response cache: {stats['hits']} hit(s), {stats['misses']} miss(es).")
 
     def _load_system_prompt(self) -> str:
         with open("config/prompts/system_prompt.txt", "r") as f:

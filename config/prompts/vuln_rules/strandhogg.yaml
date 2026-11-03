@@ -8,7 +8,11 @@ prompt: |
   - AND `android:taskAffinity` is NOT defined (inherits package name) OR is explicitly empty/custom.
   - AND `android:exported="true"`.
   - This configuration allows a malicious app to insert its activity into the victim's task stack (Task Hijacking).
-  
+
+  Not vulnerable if `android:taskAffinity` is explicitly set to a value distinct from the
+  package's default, or if the Activity is not exported and carries no public intent-filter
+  (so no other app can start it to begin the task-stack insertion).
+
   Code to Analyze:
   ```xml
   {code_snippet}

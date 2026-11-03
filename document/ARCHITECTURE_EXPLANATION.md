@@ -4,52 +4,66 @@
 
 ---
 
-**Smart Engine Filtering** is a major architectural optimization in Droid-LLM-Hunter designed to drastically reduce token usage while increasing scan speed and accuracy.
+Hybrid mode combines rule-driven static discovery with LLM context and exhaustive deep scheduling. Its performance optimizations change execution order and remove redundant calls; they do not turn a score, risk vote, top-N list, or time budget into a candidate cutoff.
 
 ---
 
-## 🛑 The Problem with the Old Approach
-Previously, Droid-LLM-Hunter operated with a simple and somewhat inefficient pipeline:
-1.  **Scanner:** Searched for simple "keywords" (e.g., "WebView").
-2.  **LLM:** Sent *every* file containing "WebView" to the LLM for analysis.
-3.  **Consequence:**
-    *   **Token Waste:** Hundreds of safe files were sent to the LLM unnecessarily.
-    *   **Slow & Expensive:** Processing non-vulnerable boilerplate code wasted time and API credits.
-    *   **False Positives:** Simple keywords often matched harmless comments or library usage.
+## The Previous Hybrid Bottleneck
+
+The previous exhaustive hybrid path performed two preliminary LLM calls for each scoped candidate:
+
+```text
+N sequential summary calls
++ N sequential risk-triage calls
++ deep rule analysis
+```
+
+Risk-triage no longer controlled candidate membership because the selector already appended the complete candidate list. It consumed another `N` calls only to influence order, while sequential summarization prevented available provider concurrency from being used.
 
 ---
 
-## 🚀 The Solution: Hybrid Approach (Two-Stage Analysis)
-We have implemented a **Two-Stage Logic Pipeline** to optimize the detection process:
+## Current Hybrid Pipeline
 
-### Stage 1: "The Smart Filter" (Python Engine 🐍)
-This acts as a "Coarse Sieve" running **locally** using **Regex (Regular Expressions)**.
+### Stage 1: Enabled-Rule Signal Discovery
 
-*   **Mechanism:** Searches for specific **Code Patterns**, not just keywords.
-*   **Cost:** FREE (0 Tokens).
-*   **Speed:** Blazing Fast (< 1 second).
-*   **Examples:**
-    *   **PendingIntent:** Doesn't just find `PendingIntent`, but looks for the pattern: `PendingIntent` + (`getActivity` OR `getService`) + `FLAG_MUTABLE` (or its decompiled integer value `33554432`, since JADX inlines the constant).
-    *   **ZipSlip:** Doesn't just find `ZipEntry`, but looks for `ZipEntry` + `.getName`.
+`CodeFilter` collects files matching the **union** of keywords and regex patterns supplied by all active rules. Hybrid strict mode does not add the old catch-all keyword list, so active rules define the discovery surface. A file can enter through a keyword even when it does not match a regex.
 
-If the specific regex pattern is **NOT** found, the file is immediately discarded. The LLM is never invoked.
+The package-aware scope filter then removes known third-party/irrelevant paths. `--scan-libraries` is additive: its library-specific candidates are unioned with, rather than substituted for, the normal candidate set.
 
-### Stage 2: "The Intelligent Verifier" (LLM / AI 🤖)
-This acts as the "Judge", analyzing only the files that survived Stage 1.
+This is the candidate-discovery boundary. It is not a model score threshold, and the performance work did not narrow any existing rule keyword or regex.
 
-*   **Mechanism:** Analyzes code **context**, variable flow, and security checks.
-*   **Task:** Confirms if the Stage 1 finding is an actual exploitable bug or a false positive.
-*   **Example:**
-    *   *Engine* flags a file for ZipSlip pattern.
-    *   *LLM* is asked: "I see `ZipEntry.getName` here. Is there a `getCanonicalPath` check preceding it?"
+### Stage 2: Parallel, Deterministic Summarization
 
-### Stage 2.5: "Recall Safeguard" — static hits are never silently dropped
+Every scoped hybrid candidate is summarized. `analysis.summary_workers` bounds concurrent calls (`2` by default), while results are restored to original candidate order before app-summary, attack-surface, and cross-reference context are built.
 
-In `hybrid` mode a lightweight LLM **risk-triage** (`identify_risk_prompt.txt`) reads each file's *summary* and votes *risky / not risky* before the deep scan, to save tokens. Because that vote is a coarse LLM judgment, it can occasionally drop a genuinely vulnerable file. To protect recall, **any first-party file whose content matches an enabled rule's `detection_pattern` is deep-scanned regardless of the triage vote** (`Engine._pattern_matched_files`). A static pattern hit is a strong signal, so it must reach rule gating + the rule LLM — it is never discarded by the triage. This is scoped to the app package, so library files still go through the normal triage and the added cost stays bounded to first-party code.
+Summary failure is fail-open:
 
-> This safeguard was added after the Layer-2 testbed caught the triage dropping `ZipSlipActivity` even though the `zip_slip` pattern matched it.
+```text
+timeout / exception / empty / invalid batch item
+        -> record Error/Unanalyzed
+        -> retain candidate for deep scan
+```
 
-### Stage 3: "Specialized Pipelines" (Resource Files 📄)
+`summary_batch_size` remains `1` by default. Values above `1` are opt-in; partial or invalid batches retry affected items individually using their established context. A failed fallback never marks the candidate safe.
+
+### Stage 3: Exhaustive Priority Queue
+
+Files matching an enabled rule's `detection_pattern` are placed first. Every remaining scoped candidate is appended in stable order, deduplicated, and submitted to the bounded deep-scan executor.
+
+```text
+priority = static-pattern hits + every remaining scoped candidate
+membership = every scoped candidate
+```
+
+The legacy `identify_risk_prompt.txt` path is disabled by default (`hybrid_risk_triage: false`) because it was redundant. Enabling it restores its ordering signal for comparison/rollback, but `_select_deep_scan_targets()` still unions the complete candidate list: a `NO`, timeout, or malformed triage response cannot remove a file.
+
+### Stage 4: Deep Rule Analysis
+
+Each scheduled file is evaluated against active rules. A rule's own `detection_pattern`/`static_analysis.patterns` routes that file-rule pair; rules without a pattern always run. A matched pair reaches the specialized rule LLM, which evaluates attacker control, sink use, validation, and exploitability.
+
+All futures finish before hybrid results are merged in stable submission order. The report records scheduled/completed/error files and scheduled/accounted rule checks. Incomplete accounting becomes a pipeline error, never a clean scan.
+
+### Stage 5: Specialized Resource Pipelines
 Some rules target **configuration files** (XML) rather than source code. These bypass the Regex Filter and use dedicated parsers:
 
 *   **Manifest Analysis:** 
@@ -64,7 +78,7 @@ Some rules target **configuration files** (XML) rather than source code. These b
 
 ## 💾 Cross-Cutting Layer: The Response Cache
 
-Wrapping **every** stage above is a content-addressed **response cache**. Before *any* request reaches the LLM — summarization, risk identification, deep-scan verification, app summary, or exploit generation — the engine computes a hash of `model + system prompt + rule prompt + code` and checks disk (`output/.dlh_cache/`):
+Wrapping every LLM-backed stage is a content-addressed response cache. Before a request reaches the provider—summarization, optional legacy risk identification, deep-rule verification, app summary, attack-surface mapping, or exploit generation—the engine computes a hash from model/client fingerprint, prompts, and code and checks `output/.dlh_cache/`:
 
 ```text
         [ Any LLM call ]
@@ -85,15 +99,17 @@ Wrapping **every** stage above is a content-addressed **response cache**. Before
 *   **HIT:** the stored response is returned instantly, at zero token cost.
 *   **MISS:** the LLM is called, and only a **successful** response is written back. Failed (empty) responses are never cached, so a later run retries them.
 
-This turns an interrupted scan (crash, rate limit) into a **free resume** — re-running the same command replays completed work from cache and only spends tokens on what remains — and deduplicates identical chunks within a single run. Because the key includes the model and prompt, changing either recomputes automatically. Toggle via `analysis.use_cache` or `--no-cache`. See [Configuration](CONFIGURATION.md#performance--cost-controls).
+This lets an interrupted scan reuse completed responses and deduplicates concurrent requests for the same key. Cache counters are synchronized and successful files are published atomically. A cache hit avoids provider work, but it does not bypass candidate scheduling or deep-scan accounting. Toggle via `analysis.use_cache` or `--no-cache`. See [Configuration](CONFIGURATION.md#performance--cost-controls).
 
 ---
 
 ## 🛠️ Technical Implementation
 
 1.  **Engine (`code_filter.py` & `engine.py`):**
-    *   Updated to parse `detection_pattern` fields from YAML rules.
-    *   Executes high-performance regex matching locally before queueing LLM requests.
+    *   Builds candidates from the additive union of active-rule keywords/regex.
+    *   Runs summaries with bounded workers and restores deterministic context order.
+    *   Uses static hits as priority only, then submits the complete scoped queue.
+    *   Reconciles file and rule accounting before publishing a completed report.
 
 2.  **Rules (`yaml`):**
     *   Vulnerability rules now support a new field: `detection_pattern`.
@@ -104,39 +120,27 @@ This turns an interrupted scan (crash, rate limit) into a **free resume** — re
 
 ---
 
-## ⚡ Key Benefits
-1.  **Cost Efficiency:** Token usage reduced by **50-80%** by filtering out non-candidates locally.
-2.  **Speed:** Massively faster scans as the CPU handles the bulk of the filtering, not the Cloud API.
-3.  **Accuracy:** Combines the precision of Regex with the contextual understanding of LLMs.
-4.  **Large Scale Scalability:** Solves the "Context Overflow" problem by ensuring only relevant file chunks enter the LLM context window.
+## Verified Effect
+
+The final synthetic A/B profile retained `1,052/1,052` scoped/deep files and `315/315` file-rule checks. Removing redundant triage reduced total calls from `2,421` to `1,369` (43.45%), while two summary workers reduced summary time by 49.44%. End-to-end synthetic orchestration improved by 9.44%.
+
+Those numbers use a deterministic fake provider and are not a promise about real Codex latency. Large APKs can still take hours because Smali call-graph construction, candidate collection, and exhaustive deep rule analysis remain. The golden current-model audit retained 22/25 recall with no new precision violation or hidden analysis error.
 
 ---
 
 ## ❓ FAQ: Backward Compatibility
 
-### Will existing (Legacy) rules break?
-**NO.** The architecture is fully **Backward Compatible**.
+### Will keyword-only rules still run?
 
-1.  **Legacy Rules (Keyword Only):**
-    *   Rules like `sql_injection` that lack a `detection_pattern` rely on the standard `keywords` list.
-    *   The Engine continues to use the standard "Keyword Search" for these.
-    *   **Result:** They work exactly as before (slightly less efficient than new rules).
+Yes. Keywords and regex patterns are additive during candidate discovery. At deep analysis, a rule without `detection_pattern` or `static_analysis.patterns` is treated as a logic rule and runs without a pattern cutoff.
 
-2.  **New Rules (Keyword + Regex):**
-    *   Automatically utilize the "Smart Filter" optimization.
-    *   **Result:** Higher efficiency and speed.
+### Does adding a `detection_pattern` switch the global mode?
 
-### How to optimize Legacy Rules?
-Simply add a `detection_pattern` field to their YAML definition.
-Example for `webview_xss.yaml`:
-```yaml
-detection_pattern: "setJavaScriptEnabled\\(true\\)|addJavascriptInterface"
-```
-Once added, the Engine automatically switches to Hybrid Mode for that rule.
+No. `filter_mode` is selected explicitly in `settings.yaml` or through `config filter-mode`. A rule pattern contributes discovery/routing signals inside `hybrid` or `static_only`; it does not change the global mode.
 
 ## ⚠️ Limitations & Trade-offs (Blind Spots)
 
-For full transparency, it is important to understand the "Blind Spots" of this Regex-based approach. While it covers 95-99% of standard cases, some edge cases might be missed to preserve performance.
+For full transparency, rule-driven candidate discovery can miss unfamiliar wrappers, obfuscated identifiers, reflection, or APIs not represented by current additive signals. No universal coverage percentage is claimed.
 
 ### 1. Hardcoded Secrets (Entropy + Naming)
 *   **Pattern:** `(?i)(AIza…|AKIA…|const-string.*(api_key|password|secret|token)|(api_key|password|secret|token).*=.*["'])`
