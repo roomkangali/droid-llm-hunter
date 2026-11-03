@@ -1,18 +1,17 @@
-name: "Deep Link Logic Bypass"
-description: "Detects logic flaws in Deep Link handling, such as IDOR, Authentication Bypass, and Open Redirects."
+name: "Fragment Injection"
+description: "Detects Fragment Injection vulnerabilities in exported PreferenceActivities that fail to implement isValidFragment properly."
 prompt: |
-  Analyze the following Java/Smali code for Deep Link Logic Flaws.
+  Analyze the following Java/Smali code for Fragment Injection vulnerabilities.
   
   Vulnerability Pattern:
-  - Code handles URI parameters using `getQueryParameter("token")`, `("url")`, `("redirect")`, `("next")`.
-  - Weak validation logic, e.g., `url.startsWith("http")` (can be bypassed with `http.evil.com`).
-  - Usage of sensitive parameters (auth tokens, user IDs) directly from the Deep Link without session verification.
-  - Open Redirects: `intent.setData(Uri.parse(param))` or `webview.loadUrl(param)` without host validation.
+  - The Class extends `PreferenceActivity`.
+  - The Activity is `exported=true` (check Manifest context if available, otherwise assume risky if unknown).
+  - The method `isValidFragment` is MISSING or simply returns `true` without validation.
+  - This allows attackers to load arbitrary fragments via `Intent.EXTRA_SHOW_FRAGMENT` (`:android:show_fragment`).
 
-  Not vulnerable if every sensitive parameter extracted from the deep link is re-validated
-  server-side (a real session/auth check) before use, or if the redirect/URL target is checked
-  with an exact host match against an allowlist (not `startsWith`/`contains`, which bypass via
-  `http.evil.com` or `trusted.com.evil.com`).
+  Not vulnerable if `isValidFragment` checks the requested fragment name against an explicit
+  allowlist of trusted class names (not just returning `true` for everything), or if the Activity
+  is not exported and cannot be reached by other apps.
 
   Code to Analyze:
   ```
@@ -22,17 +21,13 @@ prompt: |
   Context:
   - File Path: {file_path}
   
-  Identify if:
-  1. The code extracts sensitive params or URL targets from the Intent URI.
-  2. The validation is missing OR weak (e.g. simple `startsWith`, `contains`).
+  Determine if the Activity is vulnerable:
+  1. Does it extend `PreferenceActivity`?
+  2. Is `isValidFragment` missing or insecure (always true)?
   
-  If yes, report VULNERABLE and describe the bypass method (e.g., "Attacker can supply malicious URL via 'redirect' parameter").
+  If yes, report it as VULNERABLE.
 keywords:
-  - "getQueryParameter"
-  - "getData"
-  - "startsWith"
-  - "loadUrl"
-  - "redirect"
-  - "token"
-tags: ["deeplink", "idor", "open_redirect", "logic_flaw"]
-detection_pattern: "(?i)(\\.(getQueryParameter|getData)|Uri\\.parse|scheme|host)"
+  - "PreferenceActivity"
+  - "isValidFragment"
+detection_pattern: "(\\.super Landroid/preference/PreferenceActivity;|extends\\s+PreferenceActivity)"
+tags: ["fragment_injection", "rce", "preference_activity"]
