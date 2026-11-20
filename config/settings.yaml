@@ -45,6 +45,9 @@ llm:
   codex_timeout: 300 # seconds per call. Real calls land at 7-12s; 300 leaves 25x headroom while still failing fast (3 retries x timeout is the worst case per file)
   codex_sandbox: read-only # read-only | workspace-write | danger-full-access. Keep read-only: the code under analysis is already inlined in the prompt, so the agent has no reason to write anything — raising this lets model-generated commands modify your machine
   codex_reasoning_effort: medium # none|low|medium|high|xhigh|max|ultra (verified live for this model; "minimal" is rejected by it). low/none give shallow verdicts; medium+ actually name the tainted source. Raise to high/xhigh for a final audit — changing it invalidates the cache for this provider, so the new level really re-runs
+  claude_cli_model: sonnet # alias ("sonnet"/"opus"/"haiku") or a full model name; null = CLI's own default. NOT free — billed against the local `claude` login's account, ~$0.05-0.08/call cold, ~$0.01-0.015/call once Anthropic's server-side cache is warm, 3-11s latency even warm. Measured slower/pricier than codex/router9 for the same prompt — keep this off `provider`/bulk roles unless you specifically want Claude's own model for a low-volume role like exploit_provider
+  claude_cli_path: claude # path to the Claude Code CLI binary (must be on PATH, or give an absolute path)
+  claude_cli_timeout: 300 # seconds per call. Real calls land at 3-13s; 300 leaves generous headroom while still failing fast
   exploit_provider: codex # --generate-exploit routed here (router9/jem-glm-5.2 returned empty for exploit-gen, confirmed live); reuses anthropic_api_key/anthropic_model above
   exploit_model: null # optional: override the model used for exploit-gen on exploit_provider (or on `provider`, if exploit_provider is unset)
   max_tokens: 32768 # [#6] Max output tokens per LLM call (raise if JSON/exploit output gets cut off)

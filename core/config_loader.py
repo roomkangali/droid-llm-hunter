@@ -42,6 +42,13 @@ class LLMSettings(BaseModel):
     # none|low|medium|high|xhigh|max|ultra (the accepted set is model-dependent — verified
     # live against gpt-daybreak-blue-latest, which rejects "minimal"). None -> Codex default.
     codex_reasoning_effort: Optional[str] = None
+    # Claude Code CLI (local agent binary, NOT an HTTP API — same reasoning as Codex
+    # above: no api_key, auth comes from the local `claude` login). Model optional:
+    # unset means "use the CLI's own default" (e.g. "sonnet"). NOT free — see the
+    # cost note in modules/llm_client/claude_cli.py before pointing a bulk role at it.
+    claude_cli_model: Optional[str] = None
+    claude_cli_path: Optional[str] = "claude"
+    claude_cli_timeout: int = 300
     max_tokens: int = 4096  # [#6] Max output tokens per LLM call (avoid truncated JSON/exploit)
     # [v1.3.0] Route --generate-exploit to a DIFFERENT provider/model than scanning.
     # Some models refuse or silently return empty output for exploit/PoC generation
