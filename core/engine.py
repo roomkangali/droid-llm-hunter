@@ -11,6 +11,7 @@ from modules.llm_client.anthropic import AnthropicClient
 from modules.llm_client.openrouter import OpenRouterClient
 from modules.llm_client.router9 import Router9Client
 from modules.llm_client.codex import CodexClient
+from modules.llm_client.claude_cli import ClaudeCliClient
 from core.call_graph import CallGraphBuilder
 from core.manifest_parser import ManifestParser
 import os
@@ -196,6 +197,18 @@ class Engine:
             # key must not be the empty string — that would collide with any other
             # unset-model provider. Label it distinctly for cache purposes only.
             model = model or "codex:default"
+        elif provider == "claude_cli":
+            # Local CLI agent, not an HTTP API: no api_key, auth comes from the local
+            # `claude` login. See claude_cli.py for the cost caveat before using this
+            # as a bulk provider.
+            model = model_override or self.settings.llm.claude_cli_model
+            raw_client = ClaudeCliClient(
+                model=model,
+                cli_path=self.settings.llm.claude_cli_path or "claude",
+                max_tokens=max_tokens,
+                timeout=self.settings.llm.claude_cli_timeout,
+            )
+            model = model or "claude_cli:default"
         else:
             raise ValueError(f"Unsupported LLM provider: {provider}")
 
